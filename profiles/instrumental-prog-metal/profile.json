@@ -1,0 +1,64 @@
+{
+  "sample_rate": 44100,
+  "loud_parts": "3 s short-term windows within 3 LU of the loudest",
+  "master_integrated_lufs": -9,
+  "references": [
+    {
+      "file": "Intervals - mnemonic.flac",
+      "integrated_lufs": -6.76,
+      "max_short_term_lufs": -5.09,
+      "peak_to_loudness_db": 7.38,
+      "bands_db": {
+        "31.5": -9.93,
+        "63": -6.6,
+        "125": -6.35,
+        "250": -9.68,
+        "500": -12.5,
+        "1000": -10.82,
+        "2000": -10.12,
+        "4000": -13.39,
+        "8000": -16.15
+      },
+      "side_mid_db": -8.25,
+      "side_mid_below_120hz_db": -14.54
+    },
+    {
+      "file": "Intervals - neurogenesis.flac",
+      "integrated_lufs": -6.84,
+      "max_short_term_lufs": -5.33,
+      "peak_to_loudness_db": 7.17,
+      "bands_db": {
+        "31.5": -9.57,
+        "63": -6.7,
+        "125": -6.26,
+        "250": -10.02,
+        "500": -13.1,
+        "1000": -9.94,
+        "2000": -9.95,
+        "4000": -13.31,
+        "8000": -17.76
+      },
+      "side_mid_db": -7.36,
+      "side_mid_below_120hz_db": -11.88
+    },
+    {
+      "file": "Portraits - Vaguely Western - 02 Glitch.flac",
+      "integrated_lufs": -8.58,
+      "max_short_term_lufs": -6.47,
+      "peak_to_loudness_db": 8.99,
+      "bands_db": {
+        "31.5": -10.32,
+        "63": -6.21,
+        "125": -5.53,
+        "250": -7.04,
+        "500": -11.82,
+        "1000": -14.76,
+        "2000": -12.77,
+        "4000": -15.71,
+        "8000": -19.75
+      },
+      "side_mid_db": -6.8,
+      "side_mid_below_120hz_db": -12.63
+    }
+  ]
+}

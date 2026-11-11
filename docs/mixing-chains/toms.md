@@ -19,7 +19,7 @@ Goal: full, round fills that cut through, with no wash from open tom mics betwee
 ### toms.eq
 - **Why:** toms get boxy (200-400 Hz) and flat (600-800 Hz), and lose stick attack.
 - **Start:** wide cut 200-400 Hz; cut 600-800 Hz, sometimes hard; boost 2-4 kHz for attack and 6-8 kHz for air, judged with the cymbals playing; tame 100-200 Hz resonances, then a low shelf near 100 Hz for weight.
-- **Tool:** `PeakFilter`, shelves, `ZL Equalizer 2`.
+- **Tool:** `PeakFilter`, `LowShelfFilter`, `HighShelfFilter`, `ZL Equalizer 2`.
 - **Needed if:** a band rises more than 6 dB over its neighbours, or attack is low on tom hits.
 - **Worked if:** the peak falls and attack rises in the mix during fills.
 

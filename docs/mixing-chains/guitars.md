@@ -89,6 +89,6 @@ Goal: wide, heavy, tight rhythm guitars that leave room for the kick, bass, snar
 ### guitars.lead
 - **Why:** a lead must sit above the rhythms and have its own space.
 - **Start:** high-pass up to 160 Hz, a little more mids, smooth compression. A tempo delay on a send with its return filtered dark, and a short reverb with pre-delay.
-- **Tool:** filters, `MJUCjr`; `Delay` (`mix` 1) and `DragonflyHallReverb` (`dry_level` 0) on buses fed by sends.
+- **Tool:** `HighpassFilter`, `LowpassFilter`, `MJUCjr`; `Delay` (`mix` 1) and `DragonflyHallReverb` (`dry_level` 0) on buses fed by sends.
 - **Needed if:** the song has a lead guitar.
 - **Worked if:** the lead's 1-4 kHz energy sits above the rhythms' while it plays, and its delay return adds tail energy in the gaps between phrases.
