@@ -27,6 +27,7 @@ MIX_DEFAULT = 0.5
 PLUGINS = ROOT / "plugins"
 MAX_TRUE_PEAK_DBTP = -1.0
 LUFS_TOLERANCE = 0.005
+MASTER_IN = "master-in"
 
 
 def load(step):
@@ -108,7 +109,7 @@ def timeline(recipe, song):
     return rate, length + round(recipe.get("tail_seconds", 0) * rate)
 
 
-def check(recipe, rate, length):
+def check(recipe, rate, length, strict=True):
     stems, buses, sections = recipe["stems"], recipe.get("buses", {}), recipe.get("sections", {})
     names = bus_order(recipe)
     for name, settings in stems.items():
@@ -119,6 +120,8 @@ def check(recipe, rate, length):
             sys.exit(f"bus {name}: unknown fields {sorted(unknown)}")
         if settings.get("bus", "mix") not in names + ["mix"]:
             sys.exit(f"bus {name}: unknown parent {settings['bus']} (declare it in buses)")
+    if MASTER_IN in names:
+        sys.exit(f"{MASTER_IN} is the input of the last master step, not a bus")
     if clash := (set(names) | {"mix"}) & set(stems):
         sys.exit(f"bus names clash with stem names: {sorted(clash)}")
     if "mix" in buses:
@@ -133,7 +136,8 @@ def check(recipe, rate, length):
                 sys.exit(f"{name}: send gain_db must be a number")
     returns = {send["bus"] for settings in sources(recipe).values() for send in settings.get("sends", [])}
     fed = {settings.get("bus", "mix") for settings in sources(recipe).values()} | returns
-    if unfed := set(buses) - fed:
+    # Off variants that remove a send leave its return unfed; it then renders silence.
+    if strict and (unfed := set(buses) - fed):
         sys.exit(f"buses nothing feeds: {sorted(unfed)}")
     check_sections(sections, length / rate)
     steps = recipe.get("steps", [])
@@ -159,7 +163,7 @@ def check(recipe, rate, length):
         if error:
             sys.exit(f"{label}: {error}")
     master = [step for step in steps if step.get("stage") == "master"]
-    if master and master[-1]["plugin"] not in LIMITERS:
+    if strict and master and master[-1]["plugin"] not in LIMITERS:
         sys.exit(f"the last master step must be a limiter ({', '.join(sorted(LIMITERS))})")
     check_cycles(recipe)
 
@@ -305,17 +309,38 @@ def measure(audio, rate):
     return pyloudnorm.Meter(rate).integrated_loudness(audio), true_peak_dbtp(audio)
 
 
+class Result:
+    def __init__(self, recipe, song, taps=(), strict=True, boundary=None):
+        self.rate, length = timeline(recipe, song)
+        check(recipe, self.rate, length, strict)
+        if unknown := set(taps) - set(sources(recipe)) - {MASTER_IN}:
+            sys.exit(f"--tap names no stem or bus: {sorted(unknown)}")
+        self.mixer = Mix(recipe, song, self.rate, length, taps)
+        self.mix = self.mixer.render()
+        self.tapped = self.mixer.tapped
+        self.master_steps = [step for step in recipe.get("steps", []) if step.get("stage") == "master"]
+        if not self.master_steps and MASTER_IN in taps:
+            sys.exit(f"--tap {MASTER_IN} needs master steps")
+        self.boundary = boundary or (self.master_steps[-1].get("id") if self.master_steps else None)
+
+    def master(self, mix):
+        """Returns the input of the boundary step (the last master step by default) and the master.
+
+        A variant without the boundary step has nothing between the two, so a check that removes the
+        limiter measures no limiting instead of whatever step now comes last.
+        """
+        ids = [step.get("id") for step in self.master_steps]
+        split = ids.index(self.boundary) if self.boundary in ids else len(ids)
+        master_in = process(mix, self.rate, self.master_steps[:split], "mix", self.mixer)
+        return master_in, process(master_in, self.rate, self.master_steps[split:], "mix", self.mixer)
+
+
 def render(recipe_path, start_seconds=None, end_seconds=None, final=False, taps=()):
     song = Path(recipe_path).parent
     recipe = json.loads(Path(recipe_path).read_text())
-    rate, length = timeline(recipe, song)
-    check(recipe, rate, length)
-    master_steps = [step for step in recipe.get("steps", []) if step.get("stage") == "master"]
-    if unknown := set(taps) - set(sources(recipe)):
-        sys.exit(f"--tap names no stem or bus: {sorted(unknown)}")
     target = master_target(recipe) if final else None
-    mixer = Mix(recipe, song, rate, length, taps)
-    mix = mixer.render()
+    result = Result(recipe, song, taps)
+    rate, mix, tapped = result.rate, result.mix, result.tapped
 
     first = round((start_seconds or 0) * rate)
     last = round(end_seconds * rate) if end_seconds is not None else len(mix)
@@ -325,20 +350,23 @@ def render(recipe_path, start_seconds=None, end_seconds=None, final=False, taps=
     out.parent.mkdir(exist_ok=True)
     soundfile.write(out, mix[first:last], rate, subtype="FLOAT")
     written = [out]
-    for name, audio in mixer.tapped.items():
+    for name, audio in tapped.items():
         kind = "stem" if name in recipe["stems"] else "bus"
         written.append(song / "renders" / f"tap-{kind}-{name.removesuffix('.wav')}.wav")
         soundfile.write(written[-1], audio[first:last], rate, subtype="FLOAT")
     # Integrated loudness is song-wide, so a clip gets no master.
-    if not master_steps or (first, last) != (0, len(mix)):
+    if not result.master_steps or (first, last) != (0, len(mix)):
         if final:
             sys.exit("--master needs master steps and a whole-song render")
         return written
+    master_in, mastered = result.master(mix)
+    if MASTER_IN in taps:
+        written.append(song / "renders" / f"tap-{MASTER_IN}.wav")
+        soundfile.write(written[-1], master_in, rate, subtype="FLOAT")
     master = song / "renders" / ("master.wav" if final else "trial.wav")
     # Written aside and checked first, so a failed render never replaces a good one.
     candidate = master.with_name(master.stem + ".tmp.wav")
     try:
-        mastered = process(mix, rate, master_steps, "mix", mixer)
         soundfile.write(candidate, mastered, rate, subtype="PCM_24")
         lufs, peak = measure(*soundfile.read(candidate, always_2d=True))
         # The 24-bit write clamps at full scale, so the file's own peak hides overs.

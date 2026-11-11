@@ -4,7 +4,7 @@ Goal: glue the mix gently and judge every move at release loudness. These steps 
 
 ### mix-bus.trial-master
 - **Why:** a move that sounds right at mix level can fall apart when the limiter pushes it 10 dB. Mixing into a trial limiter shows it early.
-- **Start:** a `Gain` and a `ZL Limiter` as `stage: master` steps, driven to the profile loudness, on from the first step. `mix.wav` is then the mix before the limiter and `trial.wav` the trial master; limiter dip is their difference. Judge it on whole-song renders. It is a trial, not the master.
+- **Start:** a `Gain` and a `ZL Limiter` as `stage: master` steps, driven to the profile loudness, on from the first step. `mix.wav` is then the mix before the master steps and `trial.wav` the trial master; limiter dip is measured across the limiter alone (`--tap master-in`). Judge it on whole-song renders. It is a trial, not the master.
 - **Tool:** `Gain`, `ZL Limiter`.
 - **Needed if:** always.
 - **Worked if:** every step's review includes trial-master numbers.

@@ -12,7 +12,7 @@ Goal: a solid, even low end that locks with the kick, and a growl in the mids th
 ### bass.split
 - **Why:** the DI gives clean, solid lows; the amp or a distorted copy gives the mid growl. Each does its band best.
 - **Start:** low-pass the DI at 200-300 Hz. High-pass the amp or distorted path at 400-700 Hz; low-pass it near 4 kHz or above. The hole between is intended. Sum to one bass bus. Some engineers distort the low end too, for a dirtier bass.
-- **Tool:** filters on the DI's bus (not the DI stem, since a send carries the stem's steps) and the amp; a send from the DI to a bus with `Distortion` or `T-Saturator`.
+- **Tool:** `LowpassFilter`, `HighpassFilter` or `ZL Equalizer 2` on the DI's bus (not the DI stem, since a send carries the stem's steps) and the amp; a send from the DI to a bus with `Distortion` or `T-Saturator`.
 - **Needed if:** the bass has a DI and an amp, or the DI alone lacks mid growl.
 - **Worked if:** low-band level spread across notes falls and 700 Hz-3 kHz energy rises at equal bus loudness.
 

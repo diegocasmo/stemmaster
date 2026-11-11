@@ -5,7 +5,7 @@ description: Render a song's recipe into a stereo mix from its stems. Use after 
 
 - Run `uv run .agents/skills/render/render.py [--master] [--tap <name>]... songs/<id>/recipe.json [<start_s> <end_s>]`. It writes `songs/<id>/renders/mix.wav` as 32-bit float, so nothing clips before the limiter.
 - Pass start and end seconds to render only the clip you are working on. The whole song is still processed, so a clip sounds exactly like that part of the full render.
-- `--tap <name>` also writes a stem's (after its steps and pan) or a bus's output from the same render to `renders/tap-stem-<name>.wav` (without the stem's `.wav`) or `renders/tap-bus-<name>.wav`, to measure a source or bus inside the full routing.
+- `--tap <name>` also writes a stem's (after its steps and pan) or a bus's output from the same render to `renders/tap-stem-<name>.wav` (without the stem's `.wav`) or `renders/tap-bus-<name>.wav`, to measure a source or bus inside the full routing. On a whole-song render, `--tap master-in` writes `renders/tap-master-in.wav`, the input of the last master step, to measure the limiter alone against `trial.wav`.
 - With `"stage": "master"` steps, a whole-song render also writes `trial.wav`, 24-bit at the stems' rate, and prints its loudness and true peak. `--master` writes `master.wav` instead, and only if it is within 0.005 LU of `master_integrated_lufs` in `profiles/<profile>/profile.json` and at or below -1 dBTP; otherwise the old `master.wav` stays. The trial limiter used while mixing goes here too, so `mix.wav` is the mix before it. Use `--master` only after the mix passes review.
 - Recipe format:
 
