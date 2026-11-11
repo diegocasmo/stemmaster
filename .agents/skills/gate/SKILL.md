@@ -1,0 +1,11 @@
+---
+name: gate
+description: Remove bleed between a drum's own hits without losing soft hits or decay. Use for kick and tom gating.
+---
+
+- Find the drum's own hits by level first: `uv run .agents/skills/analyze/hits.py --list <stem.wav>`. A tom mic also fires on snare and kick bleed; own hits form the loud group, bleed a quieter one. On song 000's Tom2, 28 own hits sat at -23 to -12 dB and about 230 bleed onsets at -36 to -30 dB: a gap of about 7 dB. Read the softest own hit (p0), not the typical one.
+- If the groups have a gap of 6 dB or more, gate at a threshold inside it. If they overlap, a level gate can't tell them apart: mute between own hits with a `Ride` instead (segments of about -60 dB from 200 ms after a hit, or later if its decay is still above the bleed, to 10 ms before the next one).
+- Judge a trial with the hits fixed on the input: render the stem without and with the gate (or `--tap` it), then run `hits.py --min-level-db <gap> <without.wav> <with.wav>`. `change.level_db`, `change.attack_db` and `change.tail_db` must stay within 1 dB on every hit (p0), and `change.bleed_db` shows the bleed removed (the chain's off-hit bleed is `bleed_db`). On Tom2, `NoiseGate` at -27 dB (ratio 10, attack 1, release 100) kept every hit's level and attack within 0.03 dB and cut bleed 2.6 dB overall and 11.5 dB above 5 kHz, but one hit lost its whole tail (p0 -73.7 dB): that trial fails.
+- `NoiseGate`: `threshold_db` (dBFS, default -100), `ratio` (default 10; 1 does nothing), `attack_ms` (default 1), `release_ms` (default 100). It has no hold, lookahead or makeup gain. Its detector holds the level for about 50 ms, so even at release 0 it starts closing about 23 ms after the level drops (44 ms at release 100). Each stereo channel is gated on its own.
+- Airwindows `Gatelope`: `thresh`, `trebsus`, `basssus` (0-1, default 0.5), `attacks` (0-1, default 1; higher opens faster), `dry_wet` (default 1). `thresh` maps to a peak level of `40 * log10(thresh)` dBFS (0.25 is -24 dB). The two sustains close the highs and lows at different speeds, so measure per band: with both at 0 a tom's low tail fell 7 dB while some highs rose 4 dB. Both at 1 never closes. Its stereo channels share one trigger.
+- A gate that can't keep every own hit and its decay is dropped, with the numbers.

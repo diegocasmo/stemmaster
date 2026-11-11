@@ -1,0 +1,12 @@
+---
+name: align
+description: Find the offset and polarity that make two mics or samples of one source sum best, and score a whole blend. Use for kick, snare and bass blends and for checking guitar timing.
+---
+
+- Run `uv run .agents/skills/align/align.py songs/<id>/recipe.json <reference> <mic> <low_hz> <high_hz>`. It reads the stems at their recipe gain (keep levels fixed while comparing), summed to mono, finds hits on the reference, and searches every whole-sample shift of the mic within ±20 ms (`--limit-ms`), in both polarities.
+- It prints, per polarity, `best_offset_samples` (put it in the mic's `offset_samples`; positive delays the mic), `best_sum_gain_db`, `sum_gain_at_0_db`, the per-hit best offset (p10/p50/p90), and `recipe_sum_gain_db` for the mic's current recipe setting. Below 0 dB the mics cancel.
+- Hold the reference at offset 0 and normal polarity: kick in, snare top, or the bass DI.
+- When the reference mic has bleed (a snare top hears the hats and kick), take hit times from a cleaner stem with `--times-from <stem>`, such as the snare sample. It is read without its recipe offset, so trying offsets on it doesn't move the windows. On song 000 that narrowed the inverted snare bottom's per-hit offsets from -82..864 to -82..-76 samples.
+- Trust an offset only when the per-hit spread is narrow and `best_at_search_edge` is false. A sample stem has its own waveform: its best low-band offset can be most of a cycle away (song 000's kick sample: -874 normal or -537 inverted), which lines up the low end but moves its attack. Check that with `--blend`.
+- Each band can pick a different winner. Score the whole blend after each change, in each band the chain names: `align.py <recipe.json> --blend <low_hz> <high_hz> <stem>...` takes hits from the first stem (or `--times-from`) and prints `sum_gain_db` with the recipe's pan, and the median attack (energy in the first 25 ms over 30-100 ms) on the same hits, timed from the most advanced stem. Keep the option that raises sum gain without lowering attack. On song 000 the kick's best low-band offsets raised sum gain from 3.41 to 5.0 dB but lowered attack from 11.97 to 3.98 dB, and the snare bottom at +247 raised sum gain from 1.18 to 1.34 dB but lowered attack from 8.85 to 8.02 dB: both fail.
+- Guitar DIs are never in the mix, so a DI with one amp only shows that amp's timing; there is nothing to align. Only shift two audible takes when the recipe or the stems' readme says they are the same performance.
