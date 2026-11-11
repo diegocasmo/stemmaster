@@ -3,7 +3,8 @@ name: analyze
 description: Measure one WAV file (a stem, mix, master, or reference). Use to judge a step or compare against a profile.
 ---
 
-- Run `uv run .agents/skills/analyze/analyze.py <file.wav>`. It prints JSON and writes nothing.
+- Run `uv run .agents/skills/analyze/analyze.py [--loud] <file.wav>`. It prints JSON and writes nothing.
+- `--loud` measures the band and stereo fields on the loud parts only (3 s windows within 3 LU of the loudest), as a profile does, and adds `loud_seconds`. Loudness and peak fields stay whole-file.
 - Copy the numbers you need into the step's review result in `recipe.json`.
 - Fields:
   - `integrated_lufs`: loudness of the whole file.

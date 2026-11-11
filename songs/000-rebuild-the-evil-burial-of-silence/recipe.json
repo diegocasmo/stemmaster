@@ -1,0 +1,466 @@
+{
+  "profile": "instrumental-prog-metal",
+  "notes": [
+    "Left out: DIs 21/23 (amped tracks exist) and vocals 24-26 (the owner's songs have none).",
+    "Headroom: all stems trimmed so the rough mix peaks near -6 dBTP. Kept as the gain staging; trimming to -18 dB averages would add nothing in floating point, and forcing the bass there would put its peaks over 0 dBFS.",
+    "KickSub offset -131 samples: kick energy below 120 Hz rises in all 913 kick hits (median +0.59 dB, minimum +0.25). Snare bottom polarity as recorded (flipping it loses 1.2 to 2.3 dB in 100 Hz-1 kHz).",
+    "Balance and guitar pairs (18/19 sit 6 to 7 dB under 20/22) are kept as set: raising 18/19 by 7 dB saved only 0.22 dB of master limiter cost and worsened hit crest and section spread; raising all guitars 3 dB made the master wider than every reference.",
+    "Applied: kick HPF 36 Hz, kick and snare compression, light tom compression (see comp-toms), hard kick and snare limiting (see lim-kick and lim-snare), guitar cut at 4 kHz, and a trial limiter while mixing, stated in the master steps.",
+    "Tried and skipped, with the measured reason: snare clipping lost 2.6 to 4.8 dB of snare crest vs limiting at the same limiter cost; mix-bus compression at about 4 dB gain reduction cut the mix's section spread from 2.81 to 1.05 LU and saved under 1 dB of limiter cost; level rides raised mix spread to 6.7 LU but the master still read 0.53; guitar filters pushed 125 Hz and 1 kHz below the references; bass split is out: the one bass stem is not documented as a DI, and a band-limited drive trial moved its peak 0.03 dB; EQ matching needs reference stems, so the profile is used instead.",
+    "Not tested yet: overhead HPF and 3-4 kHz scoop, parallel drum compression, console saturation.",
+    "Loudness: -9 LUFS is the owner's choice from measured options. At -8 the same chain dipped everything 2.93 dB on each hit and lost 3.17 dB of snare crest; at -10 the loud parts were more open (crest 10.86 dB) than any reference (8.13 to 9.45). Accepted costs at -9: loud-part crest 9.79 dB, 0.34 above the references, and the loudest 3 s sit only 0.85 LU above integrated (references 1.51 to 2.11).",
+    "Section contrast is judged against the guitars and bass (1.51 LU spread), not the full mix: the mix's 2.92 LU comes from drum density, which any reference-level master removes. The references' larger spread comes from quiet sections this song does not have."
+  ],
+  "stems": {
+    "01_KickIn.wav": {
+      "bus": "kick",
+      "gain_db": -12.3
+    },
+    "02_KickOut.wav": {
+      "bus": "kick",
+      "gain_db": -12.3
+    },
+    "03_KickSample.wav": {
+      "bus": "kick",
+      "gain_db": -12.3
+    },
+    "04_KickSub.wav": {
+      "bus": "kick",
+      "gain_db": -12.3,
+      "offset_samples": -131
+    },
+    "05_Overheads.wav": {
+      "bus": "cymbals",
+      "gain_db": -8.3
+    },
+    "06_SnareUp.wav": {
+      "bus": "snare",
+      "gain_db": -10.4
+    },
+    "07_SnareDown.wav": {
+      "bus": "snare",
+      "gain_db": -10.4
+    },
+    "08_SnareSample.wav": {
+      "bus": "snare",
+      "gain_db": -10.4
+    },
+    "09_HiHat.wav": {
+      "bus": "cymbals",
+      "gain_db": -8.3
+    },
+    "10_Tom1.wav": {
+      "bus": "toms",
+      "gain_db": -12.7
+    },
+    "11_Tom2.wav": {
+      "bus": "toms",
+      "gain_db": -12.7
+    },
+    "12_Tom3.wav": {
+      "bus": "toms",
+      "gain_db": -12.7
+    },
+    "13_Tom4.wav": {
+      "bus": "toms",
+      "gain_db": -12.7
+    },
+    "14_Tom5.wav": {
+      "bus": "toms",
+      "gain_db": -12.7
+    },
+    "15_SFX1.wav": {
+      "bus": "mix",
+      "gain_db": -22.0
+    },
+    "16_SFX2.wav": {
+      "bus": "mix",
+      "gain_db": -22.0
+    },
+    "17_Bass.wav": {
+      "bus": "mix",
+      "gain_db": -2.0
+    },
+    "18_ElecGtr1.wav": {
+      "bus": "guitars",
+      "pan": -1,
+      "gain_db": -12.7
+    },
+    "19_ElecGtr2.wav": {
+      "bus": "guitars",
+      "pan": 1,
+      "gain_db": -12.7
+    },
+    "20_ElecGtr3.wav": {
+      "bus": "guitars",
+      "pan": -1,
+      "gain_db": -12.7
+    },
+    "22_ElecGtr4.wav": {
+      "bus": "guitars",
+      "pan": 1,
+      "gain_db": -12.7
+    }
+  },
+  "steps": [
+    {
+      "id": "eq-kick-hpf",
+      "target": "kick",
+      "plugin": "ZL Equalizer 2",
+      "settings": {
+        "bypass_bypass": false,
+        "filter_status0_filter_status": "On",
+        "filter_type0_filter_type": "High Pass",
+        "freq0_freq": 36.0,
+        "order0_order": "24 dB/oct"
+      },
+      "reason": "Remove kick energy below about 36 Hz to lower master limiter cost; see the review.",
+      "review": "With the rest of the drum chain at -8 LUFS: master limiter cost 15.14 to 13.81 dB, i.e. -1.33; the final master's 31.5 Hz is -10.05 dB (refs -10.32 to -9.57)."
+    },
+    {
+      "id": "comp-kick",
+      "target": "kick",
+      "plugin": "TDR Kotelnikov",
+      "settings": {
+        "threshold_db": -36,
+        "ratio": 6,
+        "attack_ms": 20,
+        "release_peak_ms": 80,
+        "release_rms_ms": 80,
+        "quality": "Precise"
+      },
+      "reason": "Kick compression: attack 10-30 ms, release 50-100 ms, 4-8:1.",
+      "review": "Kick hit peaks already span only 0.46 dB (p50 to p99), so this mostly shapes the hit: crest +0.19 dB. Not tested apart from the snare compressor; kept as rendered with the chain."
+    },
+    {
+      "id": "comp-kick-makeup",
+      "target": "kick",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 1.86
+      },
+      "reason": "Gives back the kick body level the compressor took.",
+      "review": "Kick body level per hit back within 0.1 dB."
+    },
+    {
+      "id": "lim-kick-in",
+      "target": "kick",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 18.4
+      },
+      "reason": "Lifts the bus so the limiter's -6 dB ceiling sits at -24.4 dBFS.",
+      "review": "See lim-kick."
+    },
+    {
+      "id": "lim-kick",
+      "target": "kick",
+      "plugin": "ZL Limiter",
+      "settings": {
+        "output_ceiling_output_ceiling": -6.0,
+        "true_peak_true_peak": false,
+        "oversampling_oversampling": "Off",
+        "attack_attack": 1.0,
+        "release_release": 30.0,
+        "recovery_recovery": 10.0,
+        "lookahead_lookahead": 2.0
+      },
+      "reason": "Limits kick peaks 6 dB below the median hit peak, so the master limiter works less. It is deliberately hard: it limits 97% of kick hits by a median 6.6 dB, yet kick crest loss at the master stays 1.13 dB, under the 3 dB budget.",
+      "review": "Ceiling at -24.4 dBFS, 6 dB under the median kick hit peak. With the snare limiter: master limiter cost at -8 LUFS 13.45 (3 dB) to 10.88 (6 dB); at -10, section spread 1.64 to 1.79 LU and cost 2.75 to 1.76. Kick and snare crest loss move under 0.4 dB."
+    },
+    {
+      "id": "lim-kick-out",
+      "target": "kick",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": -18.4
+      },
+      "reason": "Returns the bus to its level before the limiter.",
+      "review": "See lim-kick."
+    },
+    {
+      "id": "eq-kick-snare-body",
+      "target": "kick",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 190,
+        "gain_db": -4,
+        "q": 1.4
+      },
+      "reason": "All snare stems peak at 191-192 Hz and supply most of the 250 Hz octave excess. On the drums bus so the snare bleed in overheads and kick mics is cut with it and mic phase stays matched. Toms sit on their own bus so their 130-190 Hz body is not cut; later drums-bus steps skip them too. Kept as one cut per drum bus (kick, snare, cymbals), after each bus's dynamics: it is linear, so the copies equal one cut on the sum.",
+      "review": "Vs the rough mix: 250 Hz octave -5.66 to -7.10 dB; 250 Hz minus 1 kHz at 120-135 s 13.80 to 11.54 dB. Vs the same cut on the whole drum kit (toms included), 100-300 Hz energy in tom hits -2.26 to -0.25 dB and in snare hits -3.48 to -3.12 dB, each vs no cut. Final mix vs that old routing: 250 Hz -6.87 to -6.75 dB, 0.30 dB above the FLAC references (-9.94 to -7.05); -27.98 to -27.89 LUFS, -7.17 to -7.27 dBTP."
+    },
+    {
+      "id": "eq-kick-air",
+      "target": "kick",
+      "plugin": "HighShelfFilter",
+      "settings": {
+        "cutoff_frequency_hz": 6000,
+        "gain_db": 3,
+        "q": 0.7071
+      },
+      "reason": "8 kHz octave was 1.6 dB under the darkest reference. Guitars roll off above 6 kHz, so the drums supply it.",
+      "review": "Vs the previous step: 8 kHz octave -22.38 to -20.62 dB (old MP3 references; the FLAC profile's 8 kHz is -19.75 to -16.15)."
+    },
+    {
+      "id": "comp-snare",
+      "target": "snare",
+      "plugin": "TDR Kotelnikov",
+      "settings": {
+        "threshold_db": -32,
+        "ratio": 6,
+        "attack_ms": 15,
+        "release_peak_ms": 70,
+        "release_rms_ms": 70,
+        "quality": "Precise"
+      },
+      "reason": "Snare compression: attack 10-30 ms, release 50-100 ms, 4-8:1.",
+      "review": "Snare hit crest +0.97 dB, which keeps the snare inside its 3 dB crest-loss budget at the master."
+    },
+    {
+      "id": "comp-snare-makeup",
+      "target": "snare",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 1.8
+      },
+      "reason": "Gives back the snare body level the compressor took.",
+      "review": "Snare body level per hit back within 0.1 dB."
+    },
+    {
+      "id": "lim-snare-in",
+      "target": "snare",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 14.0
+      },
+      "reason": "Lifts the bus so the limiter's -6 dB ceiling sits at -20.0 dBFS.",
+      "review": "See lim-snare."
+    },
+    {
+      "id": "lim-snare",
+      "target": "snare",
+      "plugin": "ZL Limiter",
+      "settings": {
+        "output_ceiling_output_ceiling": -6.0,
+        "true_peak_true_peak": false,
+        "oversampling_oversampling": "Off",
+        "attack_attack": 1.0,
+        "release_release": 30.0,
+        "recovery_recovery": 10.0,
+        "lookahead_lookahead": 2.0
+      },
+      "reason": "Limits snare peaks 6 dB below the median hit peak, so the master limiter works less. It catches most hits, not only the loudest, on purpose; measured in the review.",
+      "review": "Ceiling at -20.0 dBFS, 6 dB under the median snare hit peak. With the snare limiter: master limiter cost at -8 LUFS 13.45 (3 dB) to 10.88 (6 dB); at -10, section spread 1.64 to 1.79 LU and cost 2.75 to 1.76. Kick and snare crest loss move under 0.4 dB."
+    },
+    {
+      "id": "lim-snare-out",
+      "target": "snare",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": -14.0
+      },
+      "reason": "Returns the bus to its level before the limiter.",
+      "review": "See lim-snare."
+    },
+    {
+      "id": "eq-snare-snare-body",
+      "target": "snare",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 190,
+        "gain_db": -4,
+        "q": 1.4
+      },
+      "reason": "Same cut as eq-kick-snare-body, on this bus.",
+      "review": "See eq-kick-snare-body."
+    },
+    {
+      "id": "eq-snare-air",
+      "target": "snare",
+      "plugin": "HighShelfFilter",
+      "settings": {
+        "cutoff_frequency_hz": 6000,
+        "gain_db": 3,
+        "q": 0.7071
+      },
+      "reason": "Same shelf as eq-kick-air, on this bus.",
+      "review": "See eq-kick-air."
+    },
+    {
+      "id": "eq-cymbals-snare-body",
+      "target": "cymbals",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 190,
+        "gain_db": -4,
+        "q": 1.4
+      },
+      "reason": "Same cut as eq-kick-snare-body, on this bus.",
+      "review": "See eq-kick-snare-body."
+    },
+    {
+      "id": "eq-cymbals-air",
+      "target": "cymbals",
+      "plugin": "HighShelfFilter",
+      "settings": {
+        "cutoff_frequency_hz": 6000,
+        "gain_db": 3,
+        "q": 0.7071
+      },
+      "reason": "Same shelf as eq-kick-air, on this bus.",
+      "review": "See eq-kick-air."
+    },
+    {
+      "id": "eq-toms-air",
+      "target": "toms",
+      "plugin": "HighShelfFilter",
+      "settings": {
+        "cutoff_frequency_hz": 6000,
+        "gain_db": 3,
+        "q": 0.7071
+      },
+      "reason": "Keeps the toms' share of the drum air shelf after they left the drums bus.",
+      "review": "Matches eq-drums-air on the toms, so their tone above 6 kHz is unchanged."
+    },
+    {
+      "id": "comp-toms",
+      "target": "toms",
+      "plugin": "TDR Kotelnikov",
+      "settings": {
+        "threshold_db": -46,
+        "ratio": 4,
+        "attack_ms": 25,
+        "release_peak_ms": 80,
+        "release_rms_ms": 80,
+        "quality": "Precise"
+      },
+      "reason": "Toms at 4:1. Gain reduction stays light (about 2 dB) because toms own no loud-window peaks, so more would change their tone without helping the master.",
+      "review": "2.1 dB median gain reduction on the tom body, 1.3 dB on peaks, over 537 hits. Toms own no loud-window peaks, so the effect on the master is small."
+    },
+    {
+      "id": "comp-toms-makeup",
+      "target": "toms",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 1.8
+      },
+      "reason": "Gives back the tom body level the compressor took.",
+      "review": "Tom body level back within 0.1 dB."
+    },
+    {
+      "id": "eq-guitars-presence",
+      "target": "guitars",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 1300,
+        "gain_db": 3,
+        "q": 0.8
+      },
+      "reason": "1 and 2 kHz octaves were 2.0 and 1.3 dB under the references' range, and guitars supply most of 0.8-2 kHz. Removing it puts 1 and 2 kHz at -15.57 and -13.47 dB, below the references, and raises master limiter cost 0.31 dB.",
+      "review": "Vs the previous step: 1 kHz -15.78 to -14.20 dB, 2 kHz -13.65 to -12.27 dB (old MP3 references; the FLAC profile's are -14.76 to -9.94 and -12.77 to -9.95), side/mid -8.10 to -7.55 dB. Guitar bus 0.9 LU louder, so every balance vs guitars dropped about 1 dB."
+    },
+    {
+      "id": "eq-guitars-4k",
+      "target": "guitars",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 4000,
+        "gain_db": -1.5,
+        "q": 1.0
+      },
+      "reason": "The master's 4 kHz octave sat 0.57 dB above the references, and guitars supply it: the same cut on the cymbals' air shelf moved 4 kHz only 0.03 dB.",
+      "review": "Master 4 kHz -12.74 to -13.48 dB (refs -15.71 to -13.31), 2 kHz -10.97 to -11.34 (refs -12.77 to -9.95), 8 kHz unchanged; side/mid -7.91 to -8.03."
+    },
+    {
+      "id": "eq-bass-kick-room",
+      "target": "17_Bass.wav",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 62,
+        "gain_db": -3,
+        "q": 2
+      },
+      "reason": "Kick (61 Hz) and bass (B1, 63 Hz) share the 62 Hz bin within 2.1 dB. Let the kick own it.",
+      "review": "Vs the previous step: 63 Hz octave -4.77 to -5.14 dB (old MP3 references; the FLAC profile's is -6.70 to -6.21). Kick over bass at the 62 Hz bin 2.1 to 4.8 dB."
+    },
+    {
+      "id": "comp-bass",
+      "target": "17_Bass.wav",
+      "plugin": "Compressor",
+      "settings": {
+        "threshold_db": -33,
+        "ratio": 4,
+        "attack_ms": 50,
+        "release_ms": 2000
+      },
+      "reason": "Bass median 3 s loudness rises 4.58 dB from 15-30 s to 120-135 s while guitars change -0.09 dB. Reduce this level swing without lowering every section. A two-stage fast-release chain moved master limiter cost only 0.05 dB, so the single compressor stays.",
+      "review": "Section loudness swing 4.58 to 1.21 dB; median bass/guitar balance -7.05 to -7.07 dB with a final +2.5 dB Gain step (fader-bass). GR median 2.48 dB and p99 8.95 dB where input exceeds -60 dBFS; median 3.09 dB if also reducing over 0.05 dB. Bass PLR 17.60 to 16.29 dB. Mix -27.70 to -27.89 LUFS, -7.26 to -7.27 dBTP; 125 Hz -6.31 to -6.60, 250 Hz -7.00 to -6.75 dB; side/mid -7.35 to -7.00 dB. Kick over bass at 60-64 Hz 4.7 to 6.3 dB (120-135 s 3.0 to 6.3), so the 62 Hz dip still leaves the kick room. At the same swing, ZL Compressor (Optical, knee 0) renders the same; TDR Kotelnikov has less distortion (THD at 31 Hz 0.14 vs 0.42%) but puts 4.8 dB GR on the quiet 15-30 s section (vs 2.0); WetCompressor cannot reach that swing (1.53 dB at 6 dB median GR) and flattens pick attack."
+    },
+    {
+      "id": "eq-bass-sub",
+      "target": "17_Bass.wav",
+      "plugin": "PeakFilter",
+      "settings": {
+        "cutoff_frequency_hz": 31,
+        "gain_db": 4,
+        "q": 1.4
+      },
+      "reason": "The 31.5 Hz octave was 2.74 dB under the references (-13.06 vs -10.32 to -9.57), 1.54 dB past the mix slack and the only band outside it. Bass B0 (31 Hz) supplies it; the kick's low energy sits at 40-64 Hz, so kick-side boosts push 63 Hz out first. The shortfall is in the stems, not the bass steps. Q 1.4 gives the same octave gain as Q 1 but adds only 0.76 dB at 62 Hz (Q 1: 1.24), so the eq-bass-kick-room dip keeps -2.24 of its -3 dB. After comp-bass, so the compressor does not take the boost back. Removing it puts 31.5 Hz 1.7 to 2.5 dB below the references.",
+      "review": "Vs the previous step (loud parts): 31.5 Hz -13.06 to -11.11 dB (0.41 inside the slack); 63 Hz -5.26 to -5.33; 125 Hz -6.71 to -6.83; 25 Hz third -24.96 to -23.80; below 22 Hz -22.91 to -22.80. Whole-file 31.5 Hz -13.15 to -11.17. Kick over bass at 60-64 Hz (kick-only vs bass-only renders, so not comparable with comp-bass's figure) 6.71 to 5.95 dB (120-135 s 6.46 to 5.70; Q 1 gives 5.47). Bass swing (bass-only render, same caveat) 1.31 to 1.39 dB. Mix -27.89 to -27.84 LUFS, -7.27 dBTP unchanged. Rejected: Q 1 (0.48 dB less kick room), Q 0.7 (dip down to -1.1 dB), drums bus and KickSub boosts (63 Hz out of slack)."
+    },
+    {
+      "id": "fader-bass",
+      "target": "17_Bass.wav",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 2.5
+      },
+      "reason": "Bass output level after its steps, before pan: sets the bass/guitar balance without changing the compressor's input.",
+      "review": "Replaces the old stem fader's +2.5 dB. Full render against it: mix.wav differs by at most 1.5e-8 and trial.wav by 4 steps of 24-bit (float32 rounding), same -8.996 LUFS."
+    },
+    {
+      "id": "master-gain",
+      "stage": "master",
+      "target": "mix",
+      "plugin": "Gain",
+      "settings": {
+        "gain_db": 21.957
+      },
+      "reason": "Drives the limiter to the profile's -9 LUFS. Solved by limit/solve.py, not set by hand.",
+      "review": "Solved to +21.957 dB: master -9.00 LUFS, -1.05 dBTP, 24-bit PCM. The mix is -28.93 LUFS, so the limiter takes 2.03 dB beyond plain gain (it took 14 dB at -8 on the old mix)."
+    },
+    {
+      "id": "master-side-shelf",
+      "stage": "master",
+      "target": "mix",
+      "plugin": "ZL Equalizer 2",
+      "settings": {
+        "bypass_bypass": false,
+        "filter_status0_filter_status": "On",
+        "filter_type0_filter_type": "High Shelf",
+        "freq0_freq": 10.0,
+        "lrmode0_lrmode": "Side",
+        "gain0_gain": -3.0
+      },
+      "reason": "Limiting alone widened the master to side/mid -4.78 (widest reference -6.80), because gain reduction hits the centered kick, snare and bass harder than the hard-panned guitars. A -3 dB side-only shelf at 10 Hz (12 dB/oct) turns the side channel down 3 dB across the band, which brings the master inside the references' width.",
+      "review": "The mix is -6.00 (wider than every reference), limiting alone gives -5.01; with the shelf the master is side/mid -8.03 dB (refs -8.25 to -6.80), below 120 Hz -14.02 (refs -14.54 to -11.88). Side -2 gave -6.96, also inside the references' range, 0.16 dB from the widest."
+    },
+    {
+      "id": "master-limit",
+      "stage": "master",
+      "target": "mix",
+      "plugin": "ZL Limiter",
+      "settings": {
+        "output_ceiling_output_ceiling": -1.1,
+        "true_peak_true_peak": true,
+        "oversampling_oversampling": "4x",
+        "attack_attack": 5.0,
+        "release_release": 30.0,
+        "recovery_recovery": 3.0
+      },
+      "reason": "Last step: reaches -9 LUFS under -1 dBTP. ZL Limiter kept more kick and snare punch and less distortion than pedalboard's Limiter. Ceiling -1.1 because -1.0 measured -0.94 dBTP. Recovery 3 ms, not 10: at 10 the limiter held a steady 11.7 dB of gain reduction and needed 10 dB more drive for the same loudness; 3 ms lowers gain swings and distortion, for about 1 dB of snare crest. No compressor or clipper before it (mix-bus compression flattened the sections, see notes).",
+      "review": "Master vs mix: -28.93 to -9.00 LUFS, -11.15 to -1.05 dBTP, PLR 7.94 (refs 7.17 to 8.99). Every octave band inside the references' plain range; 8 kHz -19.63 is the closest (0.12 above the bottom). Limiter gain swing 2.18 dB (p90-p10), median gain reduction in loud parts 0.24 dB, dip on each kick or snare hit 1.80 dB median (p90 5.75), kick and snare crest loss 1.13 and 2.75 dB (budget 3), section spread 1.69 LU (guitars and bass alone 1.51)."
+    }
+  ]
+}
