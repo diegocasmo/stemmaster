@@ -22,6 +22,7 @@ Mix and master a song from its aligned audio stems. Signal processing only: neve
 
 - The recipe is the source of truth. Renders are a cache rebuilt from the stems. To undo a step, remove its entry.
 - Install tools with `./setup.sh` and run Python with `uv run`.
+- Test code may build signals as test inputs, never in a song.
 - Process only with Python and pedalboard. Use a plugin from `plugins/` or a pedalboard built-in, whichever fits the step. Use a plugin only if it has an Apple Silicon VST3, loads without its window, and renders identically twice in fresh runs. Gain, pan, summing, sends, level rides (`Ride`) and keyed ducking (`Duck`) happen in the render script.
 - Mix with the chains in `docs/mixing-chains/`. Read its README and the chain of every source in the song before planning, and follow its done rule: every move that applies is recorded in the recipe, by id, as kept, changed or dropped, with measurements.
 - Order steps to suit the song, except:

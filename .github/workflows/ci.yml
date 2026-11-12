@@ -1,0 +1,16 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    # The owner mixes on an Apple Silicon Mac, so the numbers the tests expect are read there.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - run: uv sync --locked
+      - run: uv run pytest
