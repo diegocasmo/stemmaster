@@ -28,6 +28,7 @@ PLUGINS = ROOT / "plugins"
 MAX_TRUE_PEAK_DBTP = -1.0
 LUFS_TOLERANCE = 0.005
 MASTER_IN = "master-in"
+RESERVED = {MASTER_IN, "premaster", "trial"}
 
 
 def load(step):
@@ -54,16 +55,19 @@ def process(audio, rate, steps, target, context):
     for step in steps:
         if step["target"] != target:
             continue
+        before = audio
         if step["plugin"] in NATIVE:
             audio = NATIVE[step["plugin"]](audio, rate, step["settings"], context)
-            continue
-        plugin = load(step)
-        # Some VST3s accept only stereo, so a mono stem goes through them as two equal channels.
-        mono = audio.shape[1] == 1 and isinstance(plugin, pedalboard.VST3Plugin)
-        stereo = np.repeat(audio, 2, axis=1) if mono else audio
-        # Plugins take (channels, samples); the rest of this file uses (samples, channels).
-        out = plugin(stereo.T.astype(np.float32), rate).T.astype(np.float64)
-        audio = out.mean(axis=1, keepdims=True) if mono else out
+        else:
+            plugin = load(step)
+            # Some VST3s accept only stereo, so a mono stem goes through them as two equal channels.
+            mono = audio.shape[1] == 1 and isinstance(plugin, pedalboard.VST3Plugin)
+            stereo = np.repeat(audio, 2, axis=1) if mono else audio
+            # Plugins take (channels, samples); the rest of this file uses (samples, channels).
+            out = plugin(stereo.T.astype(np.float32), rate).T.astype(np.float64)
+            audio = out.mean(axis=1, keepdims=True) if mono else out
+        if step.get("id") in getattr(context, "probes", {}):
+            context.probed[step["id"]] = context.probes[step["id"]](before, audio, rate)
     return audio
 
 
@@ -120,8 +124,8 @@ def check(recipe, rate, length, strict=True):
             sys.exit(f"bus {name}: unknown fields {sorted(unknown)}")
         if settings.get("bus", "mix") not in names + ["mix"]:
             sys.exit(f"bus {name}: unknown parent {settings['bus']} (declare it in buses)")
-    if MASTER_IN in names:
-        sys.exit(f"{MASTER_IN} is the input of the last master step, not a bus")
+    if reserved := set(names) & RESERVED:
+        sys.exit(f"{sorted(reserved)} name the mix and master signals the check reads, not buses")
     if clash := (set(names) | {"mix"}) & set(stems):
         sys.exit(f"bus names clash with stem names: {sorted(clash)}")
     if "mix" in buses:
@@ -231,9 +235,10 @@ class Mix:
     without buses, sends or keys keep their exact samples. A keyed step pulls its key forward.
     """
 
-    def __init__(self, recipe, song, rate, length, taps=()):
+    def __init__(self, recipe, song, rate, length, taps=(), probes=None):
         self.recipe, self.song, self.rate, self.length = recipe, song, rate, length
         self.taps, self.tapped = set(taps), {}
+        self.probes, self.probed = probes or {}, {}
         self.sections = recipe.get("sections", {})
         self.steps = [step for step in recipe.get("steps", []) if step.get("stage", "mix") == "mix"]
         self.keys = {step["settings"]["key"] for step in recipe.get("steps", []) if step["plugin"] == "Duck"}
@@ -310,12 +315,12 @@ def measure(audio, rate):
 
 
 class Result:
-    def __init__(self, recipe, song, taps=(), strict=True, boundary=None):
+    def __init__(self, recipe, song, taps=(), strict=True, boundary=None, probes=None):
         self.rate, length = timeline(recipe, song)
         check(recipe, self.rate, length, strict)
         if unknown := set(taps) - set(sources(recipe)) - {MASTER_IN}:
             sys.exit(f"--tap names no stem or bus: {sorted(unknown)}")
-        self.mixer = Mix(recipe, song, self.rate, length, taps)
+        self.mixer = Mix(recipe, song, self.rate, length, taps, probes)
         self.mix = self.mixer.render()
         self.tapped = self.mixer.tapped
         self.master_steps = [step for step in recipe.get("steps", []) if step.get("stage") == "master"]

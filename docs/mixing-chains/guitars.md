@@ -4,9 +4,9 @@ Goal: wide, heavy, tight rhythm guitars that leave room for the kick, bass, snar
 
 ### guitars.align
 - **Why:** two mics or amps that capture the same take comb-filter when they are out of time or polarity. Separate takes (double tracks) are never aligned to each other.
-- **Start:** for tracks that share one DI, measure each one's offset against the DI, then align them to each other and check polarity. The DI is never in the mix.
+- **Start:** align the tracks of one take to the first of them and check polarity.
 - **Tool:** stem `offset_samples`, `invert`.
-- **Needed if:** two or more audible tracks capture the same take (they share a DI). A single amp track with its DI is dropped with its measured offset.
+- **Needed if:** two or more audible tracks capture the same take.
 - **Worked if:** at fixed levels, their sum gain in 100 Hz-2 kHz is the highest of the offsets and polarities tried.
 
 ### guitars.pair
@@ -91,4 +91,4 @@ Goal: wide, heavy, tight rhythm guitars that leave room for the kick, bass, snar
 - **Start:** high-pass up to 160 Hz, a little more mids, smooth compression. A tempo delay on a send with its return filtered dark, and a short reverb with pre-delay.
 - **Tool:** `HighpassFilter`, `LowpassFilter`, `MJUCjr`; `Delay` (`mix` 1) and `DragonflyHallReverb` (`dry_level` 0) on buses fed by sends.
 - **Needed if:** the song has a lead guitar.
-- **Worked if:** the lead's 1-4 kHz energy sits above the rhythms' while it plays, and its delay return adds tail energy in the gaps between phrases.
+- **Worked if:** the lead's 1-4 kHz energy sits above the rhythms' while it plays, and its delay return's tail in the 2 s after each phrase, as heard in the mix, is within 30 dB of the dry lead.

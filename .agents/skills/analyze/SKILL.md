@@ -25,3 +25,4 @@ description: Measure one WAV file (a stem, mix, master, or reference). Use to ju
   - `--times <hits.json>` reuses the `times_s` of an earlier run, so every trial is measured on the same hits.
   - `--min-level-db <dB>` keeps only hits at least that loud, so bleed onsets count as off-hit.
   - `--list` adds every hit's time and measures.
+- For notes (bass, guitars, synths), run `uv run .agents/skills/analyze/notes.py <stem.wav>` on a played stem (never a DI). It finds onsets by spectral flux and reads each note only up to the next: level, attack, low band and f0 (confident ones only).
