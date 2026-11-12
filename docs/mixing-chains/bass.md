@@ -3,17 +3,17 @@
 Goal: a solid, even low end that locks with the kick, and a growl in the mids that is heard on small speakers.
 
 ### bass.align
-- **Why:** the amp and any processed copies arrive later than the DI. Out of time, they cancel lows and smear notes.
-- **Start:** align the amp track to the DI (the DI is the time reference); check polarity.
+- **Why:** a bass recorded on more than one track (amp mics, a processed copy) arrives at different times on each. Out of time, they cancel lows and smear notes.
+- **Start:** align each track to the first one (the time reference); check polarity.
 - **Tool:** stem `offset_samples`, `invert`.
-- **Needed if:** the bass has a DI and an amp track.
+- **Needed if:** the bass has more than one track.
 - **Worked if:** at fixed levels, sum gain in 40-250 Hz is the highest of the offsets and polarities tried, and steady across notes.
 
 ### bass.split
-- **Why:** the DI gives clean, solid lows; the amp or a distorted copy gives the mid growl. Each does its band best.
-- **Start:** low-pass the DI at 200-300 Hz. High-pass the amp or distorted path at 400-700 Hz; low-pass it near 4 kHz or above. The hole between is intended. Sum to one bass bus. Some engineers distort the low end too, for a dirtier bass.
-- **Tool:** `LowpassFilter`, `HighpassFilter` or `ZL Equalizer 2` on the DI's bus (not the DI stem, since a send carries the stem's steps) and the amp; a send from the DI to a bus with `Distortion` or `T-Saturator`.
-- **Needed if:** the bass has a DI and an amp, or the DI alone lacks mid growl.
+- **Why:** a clean path gives solid lows; an amp or distorted copy gives the mid growl. Each does its band best.
+- **Start:** low-pass the clean path at 200-300 Hz. High-pass the amp or distorted path at 400-700 Hz; low-pass it near 4 kHz or above. The hole between is intended. Sum to one bass bus. Some engineers distort the low end too, for a dirtier bass.
+- **Tool:** `LowpassFilter`, `HighpassFilter` or `ZL Equalizer 2` on the clean path's bus (not its stem, since a send carries the stem's steps) and the amp; a send from the bass to a bus with `Distortion` or `T-Saturator`.
+- **Needed if:** the bass has a clean and an amp or distorted track, or its one track lacks mid growl.
 - **Worked if:** low-band level spread across notes falls and 700 Hz-3 kHz energy rises at equal bus loudness.
 
 ### bass.rides

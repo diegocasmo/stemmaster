@@ -70,12 +70,13 @@ def hit_times(recipe, song, audio, rate, times_from):
     return detect(source**2, rate)
 
 
-def pair(recipe, song, reference, mic, low, high, limit_ms, times_from):
+def pair(recipe, song, reference, mic, low, high, limit_ms, times_from, starts=None):
     ref_audio, rate = placed(recipe, song, reference)
     mic_audio, _ = placed(recipe, song, mic, offset=0, invert=False)
     length = max(len(ref_audio), len(mic_audio))
     ref_audio, mic_audio = (np.pad(a, (0, length - len(a))) for a in (ref_audio, mic_audio))
-    starts = hit_times(recipe, song, ref_audio, rate, times_from)
+    # Notes found elsewhere (a guitar's or bass's own onsets) replace the drum hit finder, which misses most of them.
+    starts = hit_times(recipe, song, ref_audio, rate, times_from) if starts is None else np.asarray(starts, dtype=int)
     starts = starts[starts < length]
     width, limit = round(WINDOW_MS / 1000 * rate), round(limit_ms / 1000 * rate)
     shifts, ref_energy, mic_energy, cross = search(band(ref_audio, rate, low, high), band(mic_audio, rate, low, high), starts, width, limit)
@@ -91,6 +92,8 @@ def pair(recipe, song, reference, mic, low, high, limit_ms, times_from):
             "sum_gain_at_0_db": round(float(total[limit]), 2),
             "per_hit_best_offset": {f"p{p}": int(np.percentile(per_hit, p)) for p in (10, 50, 90)},
             "best_at_search_edge": bool(best in (0, len(shifts) - 1)),
+            # Level-free: how alike the two tracks are at that offset, so a quiet far mic of one take still reads as one.
+            "best_correlation": round(float(sign * cross.sum(axis=0)[best] / max(np.sqrt(ref_energy.sum() * mic_energy.sum(axis=0)[best]), 1e-30)), 3),
         }
     now = current.get("offset_samples", 0)
     now_sign = -1 if current.get("invert", False) else 1
@@ -101,16 +104,16 @@ def pair(recipe, song, reference, mic, low, high, limit_ms, times_from):
     return {"reference": reference, "mic": mic, "band_hz": [low, high], "hits": len(starts), "recipe_sum_gain_db": now_gain, **options}
 
 
-def blend(recipe, song, names, low, high, times_from):
+def blend(recipe, song, names, low, high, times_from, starts=None):
     audios = [placed(recipe, song, name, stereo=True)[0] for name in names]
     rate = soundfile.info(song / "stems" / names[0]).samplerate
     length = max(len(a) for a in audios)
     audios = [np.pad(a, ((0, length - len(a)), (0, 0))) for a in audios]
-    starts = hit_times(recipe, song, None, rate, times_from or names[0])
+    starts = hit_times(recipe, song, None, rate, times_from or names[0]) if starts is None else np.asarray(starts, dtype=int)
     starts = starts[starts < length]
     width = round(WINDOW_MS / 1000 * rate)
-    # Panned as in the render, so hard-panned mics don't count as summing.
-    banded = [np.stack([windows(channel, starts, width) for channel in band(a, rate, low, high).T]) for a in audios]
+    # Each mic as panned in the render, folded to mono: timing and polarity errors between panned mics are heard there.
+    banded = [windows(band(a.sum(axis=1), rate, low, high), starts, width) for a in audios]
     gain = 10 * np.log10((sum(banded) ** 2).sum() / sum((w**2).sum() for w in banded))
     total = sum(audios)
     # Same hits as the sum gain, but starting at the most advanced stem, whose attack now comes first.

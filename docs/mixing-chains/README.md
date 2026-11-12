@@ -11,7 +11,7 @@ Each move is a heading `### <chain>.<move>`, where `<chain>` is the file name. I
 | [toms.md](toms.md) | Toms |
 | [overheads.md](overheads.md) | Overheads, hi-hat, cymbal spots, room mics |
 | [drum-bus.md](drum-bus.md) | Drum groups, parallel paths, drum reverb |
-| [bass.md](bass.md) | Bass DI and amp |
+| [bass.md](bass.md) | Bass |
 | [guitars.md](guitars.md) | Rhythm and lead guitars |
 | [synths.md](synths.md) | Synths, pads, piano |
 | [mix-bus.md](mix-bus.md) | Whole mix while mixing |
@@ -44,15 +44,19 @@ No published metric measures punch, tightness or depth on a finished master. A m
 - **Attack**: energy in the first 25 ms after a hit over energy 30-100 ms after it, in dB.
 - **Tail**: energy 80-200 ms after a hit over its first 30 ms, in dB.
 - **Valley**: the lowest 40-150 Hz energy between two kicks, over the kick's peak, in dB. Lower means tighter. The energy is the analytic envelope of a zero-phase band-pass, averaged over 10 ms; the peak is the highest point in the first 50 ms after the kick, the valley the lowest from there to 5 ms before the next kick. Gaps under 60 ms are skipped and counted.
-- **Sum gain**: energy of the summed mics over the sum of each mic's energy, per band, across hits. Compare polarity and timing options at the same mic levels: higher is better, and below 0 dB the mics cancel.
+- **Sum gain**: energy of the summed mics over the sum of each mic's energy, per band, across hits. Compare polarity and timing options at the same mic levels: higher is better, and below 0 dB the mics cancel. It is read on the mono sum, where timing and polarity errors between panned mics are heard.
 - **Off-hit bleed**: a mic's mean power between its own hits over its mean power in the first 100 ms of them, per band. Mean power, so the count of hits doesn't change it.
 - **Limiter dip**: the trial limiter's gain drop in the 60 ms after a kick or snare hit, against the 100 ms before it: the median of 5 ms gains before, minus the lowest after. Measured across the last master step only (`--tap master-in` against `trial.wav`), so EQ or clipping before it doesn't count as limiting. Compare two mixes with their trial masters at equal loudness.
 - **Spread**: p90 minus p10 of hit, note or short-term levels in one passage.
 - **Overlap**: in each band and 50 ms frame where both sources are within 6 dB of each other, the weaker source's energy; summed, over the band's total energy of both sources in every frame, in dB. "On kick hits" counts only the samples in the first 25 ms of kick hits, in the 6 dB test and in both sums.
 - **Section loudness**: short-term (3 s) loudness of the windows wholly inside a section, as p10, p50 and p90; its error is the p50 minus the mix's integrated loudness minus the section's `loudness_lu`.
 - **Profile range**: min to max across the profile's references, measured the same way on the mix. With no profile, record these checks as skipped.
+- **Holds**: falls by at most 0.5 dB (0.5 LU for loudness), when a move gives no number. **Rises** and **falls** likewise mean by more than 0.5 dB; **toward** a range means landing in it or moving at least 0.5 dB closer.
+- **Overlap present**: overlap above -15 dB, when a move gives no number.
+- **Damaged hit**: a hit whose level or attack falls more than 1 dB.
+- **Recovery**: the gain a step still takes 25-5 ms before each next hit in the fast passage, against the gain it gives when idle. Recovered is under 1 dB.
 
-`analyze` measures whole-file loudness, peaks, octave bands and width; its `hits.py` measures hit level, spread, attack, tail and off-hit bleed, and its `measure.py` valley, overlap, limiter dip, section loudness and profile range; `align` measures sum gain. `check` verifies a recipe records every move and measures every kept or changed one on and off.
+`analyze` measures whole-file loudness, peaks, octave bands and width; its `hits.py` measures hit level, spread, attack, tail and off-hit bleed, and its `measure.py` valley, overlap, limiter dip, section loudness and profile range; `notes.py` finds notes; `align` measures sum gain. `check` holds each move's evidence contract, computes its default outcome from these measures, and fails decisions that contradict it.
 
 ## Done rule
 
@@ -61,7 +65,7 @@ No published metric measures punch, tightness or depth on a finished master. A m
 
 ## Limits
 
-- Vocals are out of scope: vocal stems are not listed in the recipe. Guitar DIs are never re-amped or mixed in; they are only used to check timing (guitars.align). Sound effects follow synths.md by role.
+- Vocals are out of scope: vocal stems are not listed in the recipe. DI tracks (guitar or bass) are never used: not mixed in, re-amped, or used as a timing reference. Sound effects follow synths.md by role.
 - No new audio: no sample triggering beyond sample stems that already exist.
 - pedalboard's `HighpassFilter` and `LowpassFilter` are 6 dB/oct. For steeper slopes use `ZL Equalizer 2`.
 
