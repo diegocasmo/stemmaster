@@ -194,16 +194,68 @@ def test_a_cut_keeps_exact_ride_times(song):
     np.testing.assert_allclose(render.Result(out, path.parent).mix, render.Result(recipe, song).mix[2 * RATE : 8 * RATE], atol=1e-12)
 
 
-@pytest.mark.parametrize("segments, ramp_ms, window, error", [
-    ([[26.7, 27.0, 3], [27.0, 28.0, 3]], 300, ["8.6", "30"], "the cut 8.6-30 would not render"),
-    ([[20.2, 20.21, 6], [20.21, 20.23, -6]], 10, ["4.1", "25"], "the cut 4.1-25 would not render"),
-    ([[4, 5, 6]], 2000, ["2", "8"], "the song's recipe does not render"),
+@pytest.mark.parametrize("segments, ramp_ms, window", [
+    ([[26.7, 27.0, 3], [27.0, 28.0, 3]], 300, ["8.6", "30"]),
+    ([[20.2, 20.21, 6], [20.21, 20.23, -6]], 10, ["4.1", "25"]),
+    ([[16.966, 18, 6]], 0, ["12.859", "19"]),
+    ([[20.2, 22, 6]], 0, ["4.1", "25"]),
 ])
-def test_a_cut_whose_shifted_ride_would_not_render_writes_nothing(song, segments, ramp_ms, window, error):
+def test_a_cut_puts_ride_edges_on_the_whole_songs_samples(song, segments, ramp_ms, window):
     write(song, "kick.wav", noise(30))
-    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "steps": [ride(segments, ramp_ms=ramp_ms)]}))
+    recipe = {"stems": {"kick.wav": {}}, "steps": [ride(segments, ramp_ms=ramp_ms)]}
+    (song / "recipe.json").write_text(json.dumps(recipe))
 
-    with pytest.raises(SystemExit, match=error):
-        cut.cut(song / "recipe.json", window)
+    path = cut.cut(song / "recipe.json", window)
+
+    first, last = (round(float(t) * RATE) for t in window)
+    part = render.Result(json.loads(path.read_text()), path.parent).mix
+    np.testing.assert_allclose(part, render.Result(recipe, song).mix[first:last], atol=1e-9)
+
+
+def test_a_song_whose_ride_does_not_render_has_no_cut(song):
+    write(song, "kick.wav", noise(10))
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "steps": [ride([[4, 5, 6]], ramp_ms=2000)]}))
+
+    with pytest.raises(SystemExit, match="the song's recipe does not render"):
+        cut.cut(song / "recipe.json", ["2", "8"])
 
     assert not (song / "renders").exists()
+
+
+def test_a_cut_whose_trial_would_not_render_writes_nothing(song):
+    write(song, "kick.wav", noise(30))
+    trial = {"id": "t", "target": "mix", "plugin": "Ride",
+             "settings": {"ramp_ms": 300, "segments": [[18.92, 18.92 + 0.3, 3], [18.92 + 0.3, 18.92 + 1.3, -3]]}}
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "moves": [
+        {"move": "mix-bus.rides", "source": "mix-bus", "decision": "dropped", "trial": {"steps": [trial]}}]}))
+
+    with pytest.raises(SystemExit, match="trial of mix-bus.rides would not render"):
+        cut.cut(song / "recipe.json", ["4.78", "30"])
+
+    assert not (song / "renders").exists()
+
+
+@pytest.mark.parametrize("target", ["outside", "stems"])
+def test_a_cut_never_empties_a_folder_that_holds_the_song(song, tmp_path_factory, target):
+    write(song, "kick.wav", noise(10))
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}}))
+    if target == "outside":
+        (song / "renders").mkdir()
+        (song / "renders" / "cuts").symlink_to(song.parent)
+    else:
+        (song / "renders").symlink_to(song / "stems")
+
+    with pytest.raises(SystemExit, match="nothing was written"):
+        cut.cut(song / "recipe.json", ["2", "6"])
+
+    assert soundfile.info(song / "stems" / "kick.wav").frames == 10 * RATE and (song / "recipe.json").exists()
+
+
+def test_a_cut_of_a_stem_with_a_long_name(song):
+    name = "k" * 240 + ".wav"
+    write(song, name, noise(10))
+    (song / "recipe.json").write_text(json.dumps({"stems": {name: {}}}))
+
+    path = cut.cut(song / "recipe.json", ["0", "0.5"])
+
+    assert soundfile.info(path.parent / "stems" / name).frames == RATE // 2

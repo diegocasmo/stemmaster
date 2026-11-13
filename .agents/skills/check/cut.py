@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".agents" / "skills" / "render"))
 import native
 import render
+import structure
 
 USAGE = ("usage: uv run .agents/skills/check/cut.py songs/<id>/recipe.json <first_section> [<last_section>]\n"
          "       uv run .agents/skills/check/cut.py songs/<id>/recipe.json <start_s> <end_s>")
@@ -36,6 +37,24 @@ def window(recipe, args):
     except ValueError:
         sys.exit(f"{' '.join(args)}: name one or two sections of {sorted(sections)}, or give start and end seconds\n{USAGE}")
     return start, end, f"{start:g}-{end:g}"
+
+
+def shift(label, segment, seconds, first, rate):
+    """A Ride edge on the cut's timeline, at a float native.ride puts on the same sample as the whole song's edge."""
+    # Plain subtraction can land an edge a sample off once multiplied by the rate, which moves a zero-ramp step.
+    want, moved = math.ceil(seconds * rate) - first, seconds - first / rate
+    if math.ceil(moved * rate) == want:
+        return max(moved, 0.0)
+    # Mid-sample always lands right; bisect toward the plain shift for the closest time that still does.
+    bad, good = moved, max((want - 0.5) / rate, 0.0)
+    for _ in range(200):
+        mid = (bad + good) / 2
+        if mid in (bad, good):
+            break
+        bad, good = (bad, mid) if math.ceil(mid * rate) == want else (mid, good)
+    if math.ceil(good * rate) == want:
+        return good
+    sys.exit(f"{label}: segment {segment} has no time in the cut that lands on its sample, so nothing was written")
 
 
 def clip_ride(label, settings, sections, first, last, rate):
@@ -59,8 +78,8 @@ def clip_ride(label, settings, sections, first, last, rate):
                   f"differ from the whole song", file=sys.stderr)
             continue
         # Only a start before the cut is clipped; a segment may run past the audio, so the cut's end ramps as the song's.
-        # Exact shifted times, unrounded: rounding would move a ramp by a sample and part back-to-back segments.
-        segments.append([max(a, start) - start, b - start, gain])
+        a = 0.0 if a < start else shift(label, segment, a, first, rate)
+        segments.append([a, shift(label, segment, b, first, rate), gain])
     # A Ride needs a segment; one at 0 dB keeps the step, and the check reports it as doing nothing in this cut.
     return dict(settings, segments=segments or [[0, (math.ceil(ramp_ms) + 1) / 1000, 0.0]])
 
@@ -84,11 +103,21 @@ def cut_recipe(recipe, first, last, rate):
     return out
 
 
+def trials(recipe):
+    """Each hand trial's variant, built as the check builds it; the check renders variants other than the recipe loosely."""
+    return [(f"trial of {record.get('move')}", structure.apply_patch(recipe, record["trial"]))
+            for record in recipe.get("moves", []) if isinstance(record.get("trial"), dict)]
+
+
 def replace(target, write):
     """Writes a new file and moves it over the target, so a hard link or other entry already there is never written through."""
-    handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=".cut-", suffix=".tmp")
     os.close(handle)
     try:
+        # mkstemp's 0600, widened to what a plain write would get.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(temporary, 0o666 & ~umask)
         write(temporary)
         os.replace(temporary, target)
     except BaseException:
@@ -111,9 +140,17 @@ def cut(recipe_path, args):
     if not SAFE_NAME.fullmatch(name):
         sys.exit(f"{name}: a cut's name must use only letters, digits and . _ + -; give start and end seconds instead")
     out = song / "renders" / "cuts" / name
-    home = (song / "renders" / "cuts").resolve() / name
+    root = (song / "renders" / "cuts").resolve()
+    if not root.is_relative_to((song / "renders").resolve()):
+        sys.exit(f"{song / 'renders' / 'cuts'} leads outside the song's renders, so nothing was written")
+    home = root / name
     references = sorted(p for p in (song / "references").glob("*") if p.suffix.lower() in AUDIO) \
         if (song / "references").is_dir() else []
+    # The cut empties folders under home, so no input may share a path with it.
+    inputs = [song / "stems", song / "references", recipe_path] + [song / "stems" / stem for stem in recipe["stems"]] + references
+    for path in [song.resolve()] + [path.resolve() for path in inputs]:
+        if home.is_relative_to(path) and path != song.resolve() or path.is_relative_to(home):
+            sys.exit(f"{home} shares a path with the song's own {path}, so nothing was written")
     writes = [(recipe_path, "", "recipe.json")] + [(song / "stems" / stem, "stems", stem) for stem in recipe["stems"]]
     writes += [(path, "references", path.name) for path in references]
     # Every file the cut deletes or writes must be its own: a stem key like "/x", "../x" or "a/b", or a symlink,
@@ -141,15 +178,17 @@ def cut(recipe_path, args):
     spans = {stem: (first, last - min(offsets[stem], 0)) for stem in infos}
     frames = {stem: max(0, min(b, infos[stem].frames) - min(a, infos[stem].frames)) for stem, (a, b) in spans.items()}
     timeline = max(frames[stem] + offsets[stem] for stem in infos) + round(recipe.get("tail_seconds", 0) * rate)
-    try:
-        render.check(recipe, rate, length + round(recipe.get("tail_seconds", 0) * rate))
-    except SystemExit as error:
-        sys.exit(f"the song's recipe does not render, so it has no cut: {error}")
+    for label, variant in [("recipe", recipe)] + trials(recipe):
+        try:
+            render.check(variant, rate, length + round(recipe.get("tail_seconds", 0) * rate), strict=variant is recipe)
+        except SystemExit as error:
+            sys.exit(f"the song's {label} does not render, so it has no cut: {error}")
     part = cut_recipe(recipe, first, last, rate)
-    try:
-        render.check(part, rate, timeline)
-    except SystemExit as error:
-        sys.exit(f"the cut {name} would not render, so nothing was written: {error}")
+    for label, variant in [("recipe", part)] + trials(part):
+        try:
+            render.check(variant, rate, timeline, strict=variant is part)
+        except SystemExit as error:
+            sys.exit(f"the cut {name}'s {label} would not render, so nothing was written: {error}")
     for folder in ("stems", "references"):
         shutil.rmtree(out / folder, ignore_errors=True)
     (out / "stems").mkdir(parents=True)
