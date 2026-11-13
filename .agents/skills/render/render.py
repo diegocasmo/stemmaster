@@ -194,7 +194,7 @@ class Memo:
         # Cached files outlive this process, so the code and libraries that computed them are part of every key.
         # The OS build too: numpy's math and the plugins call system libraries an OS update can change.
         self.code = [CODE, sys.version, platform.platform(), os.uname().version,
-                     *(metadata.version(name) for name in ("numpy", "scipy", "pedalboard"))]
+                     *(metadata.version(name) for name in ("numpy", "scipy", "pedalboard", "numba", "llvmlite"))]
         self.tag = digest(self.code)[:16]
         self.evict()
 

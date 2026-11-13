@@ -129,8 +129,10 @@ def smoothing(ms, rate):
 def follow(level, attack, release):
     envelope, state = np.empty(len(level)), 0.0
     for index in range(len(level)):
-        coefficient = attack if level[index] > state else release
-        state = coefficient * state + (1 - coefficient) * level[index]
+        # A Python float, as the old loop's .tolist() gave: with NUMBA_DISABLE_JIT a numpy scalar would keep float32.
+        value = float(level[index])
+        coefficient = attack if value > state else release
+        state = coefficient * state + (1 - coefficient) * value
         envelope[index] = state
     return envelope
 
