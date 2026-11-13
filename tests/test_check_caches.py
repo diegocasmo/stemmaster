@@ -34,6 +34,8 @@ def test_a_recheck_reads_the_plan_from_disk_with_the_same_bytes(tmp_path, monkey
     (lambda r: r["stems"]["Kick.wav"].update(offset_samples=10), False),
     (lambda r: r["stems"]["Kick.wav"].update(bus="guitars"), False),
     (lambda r: r["sources"]["kick"].update(timing="Snare.wav"), False),
+    (lambda r: r.update(steps=[s for s in r["steps"] if s["id"] not in ("kick-comp", "gtr-hpf")]), True),
+    (lambda r: r.update(steps=[s for s in r["steps"] if s["id"] != "drums-comp"]), False),
 ])
 def test_the_plan_key_holds_what_plan_reads(tmp_path, edit, same):
     recipe = band(tmp_path, 1)

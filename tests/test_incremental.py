@@ -129,3 +129,26 @@ def test_reads_outside_a_contract_and_on_written_keys_are_not_recorded():
         entry["gain_db"] = 1
     assert list(trace.values.values()) == [-3, False]
     assert trace.complex
+
+
+def test_apply_defaults_with_traces_writes_what_it_writes_without_them(tmp_path, monkeypatch, capsys):
+    import check as check_cli
+    from test_apply_defaults import song_recipe
+
+    monkeypatch.setattr(check_cli, "structural", lambda r, s, m: (structure.nodes(r, structure.Routing(r), []), [], []))
+    written = {}
+    for name in ("traced", "untraced"):
+        song = tmp_path / name
+        (song / "stems").mkdir(parents=True)
+        recipe = song_recipe(song)
+        path = song / "recipe.json"
+        path.write_text(json.dumps(recipe, indent=2) + "\n")
+        monkeypatch.setenv("STEMMASTER_NODE_MEMO_DIR", str(tmp_path / f"memo-{name}"))
+        with monkeypatch.context() as patch:
+            if name == "untraced":
+                patch.setattr(evidence, "promote", lambda *args: None)
+            check_cli.apply_defaults(path, recipe, song, False)
+        written[name] = [path.read_text(), capsys.readouterr().out.replace(str(song), "song")] + \
+            [(song / "renders" / "check" / n).read_bytes() for n in ("report.json", "report.md")]
+
+    assert written["traced"] == written["untraced"]

@@ -334,9 +334,11 @@ def plan_key(recipe, nodes, outside):
         return {name: {"bus": entry.get("bus", "mix"), "sends": [send.get("bus") for send in entry.get("sends", [])]}
                 | {key: entry[key] for key in extra if key in entry} for name, entry in entries.items()}
     sources = {name: untext(source) for name, source in recipe.get("sources", {}).items()}
+    # Only a step on a bus that is no node adds a point, so adding or dropping a stem's or node's step keeps the key.
+    points = [target for target in dict.fromkeys(step["target"] for step in recipe.get("steps", []))
+              if target != "mix" and target not in nodes.values() and target not in recipe["stems"]]
     return fingerprint("plan", outside[:2], sources, routing(recipe["stems"], ("offset_samples",)),
-                       routing(recipe.get("buses", {})), [step["target"] for step in recipe.get("steps", [])],
-                       recipe.get("tail_seconds", 0), nodes)
+                       routing(recipe.get("buses", {})), points, recipe.get("tail_seconds", 0), nodes)
 
 
 def cached_plan(recipe, song, nodes, outside):
