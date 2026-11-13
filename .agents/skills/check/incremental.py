@@ -12,6 +12,7 @@ A contract that reads anything this can't name (a render made during its evaluat
 only the exact cache key, as before.
 """
 import contextlib
+import hashlib
 import json
 
 import render
@@ -344,10 +345,15 @@ class Keys:
                 mix = DryMix(recipe, variants.song, rate, length, taps, set(variants.probes.get(key, {})))
                 mixed = mix.render()
                 masters = [plain(step) for step in recipe.get("steps", []) if step.get("stage") == "master"]
-                master = mixed and digest("master", mixed, masters, variants.target, variants.boundary)
+                # A file's contents can change under the same path, so a master that reads one has no key.
+                if any(render.names_file(step) for step in masters):
+                    mixed_master = None
+                else:
+                    mixed_master = mixed
+                master = mixed_master and digest("master", mixed_master, masters, variants.target, variants.boundary)
             found = {f"tap:{name}": mix.tapped.get(name, "untapped") for name in render.sources(recipe)}
             found |= {"mix": mixed, "premaster": mixed, "trial": master, "master-in": master,
-                      "actual": mixed and digest("actual", mixed, masters, variants.boundary)}
+                      "actual": mixed_master and digest("actual", mixed_master, masters, variants.boundary)}
             # A master step's probe is read on the matched master pass; a mix step's on its own input and output.
             ids = {step.get("id") for step in recipe.get("steps", []) if step.get("stage") == "master"}
             found |= {f"probe:{i}": (master and digest("probe", master, i)) if i in ids else mix.probe_keys.get(i)
@@ -436,6 +442,31 @@ def finish(trace, keys, variant_keys, static, payload):
     if any(name in text for name in named):
         return None
     return {"static": static, "values": values, "signals": signals, "payload": payload}
+
+
+def seal(value):
+    """The JSON of `value` under its sha256, so a damaged file reads as a miss, never as other numbers."""
+    text = json.dumps(value)
+    return f"{hashlib.sha256(text.encode()).hexdigest()}\n{text}"
+
+
+def unseal(path):
+    """What `seal` wrote at `path`, or None when the file is missing, unreadable or damaged."""
+    try:
+        found, text = path.read_text().split("\n", 1)
+        if hashlib.sha256(text.encode()).hexdigest() != found:
+            return None
+        return json.loads(text)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def valid(trace):
+    """True when `trace` has the shape `finish` writes."""
+    return (isinstance(trace, dict) and isinstance(trace.get("static"), str) and isinstance(trace.get("payload"), dict)
+            and isinstance(trace.get("values"), list) and isinstance(trace.get("signals"), list)
+            and all(isinstance(v, list) and len(v) == 5 and isinstance(v[1], list) for v in trace["values"])
+            and all(isinstance(v, list) and len(v) == 3 for v in trace["signals"]))
 
 
 def holds(trace, keys, variant_keys, variants, static):

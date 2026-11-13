@@ -912,16 +912,20 @@ def promote(recipe, variants, ctx, master_mode):
         found = trace_path(variants, master_mode, entry["record"])
         if path.exists() or not found.exists():
             continue
-        try:
-            trace = json.loads(found.read_text())
-        except ValueError:
+        trace = incremental.unseal(found)
+        if not incremental.valid(trace):
             continue
         keys = entry["keys"]
-        if incremental.holds(trace, variants.signal_keys, keys, variants, trace_static(recipe, variants, ctx, master_mode, records, entry)):
+        try:
+            held = incremental.holds(trace, variants.signal_keys, keys, variants, trace_static(recipe, variants, ctx, master_mode, records, entry))
+        except (Exception, SystemExit):
+            # A recipe whose keys can't be computed is a miss: the check's own render reports its error in its order.
+            held = False
+        if held:
             # A traced contract matched no trial's loudness, so its trial's gain is the variant's own, as a cold run writes it.
             payload = trace["payload"] | {"needed_read_on": keys["base"], "with": keys.get("with"), "without": keys.get("without"),
                                           "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))}
-            write_atomic(path, json.dumps(payload))
+            write_atomic(path, incremental.seal(payload))
             reused += 1
     if reused:
         progress(f"{reused} contracts reused: nothing they read changed")
@@ -941,8 +945,8 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
             continue
         progress(f"contract {done}/{len(ordered)}")
         path = contract_path(recipe, variants, ctx, master_mode, records, entry)
-        if path.exists():
-            cached = json.loads(path.read_text())
+        cached = incremental.unseal(path)
+        if cached is not None:
             for source, summary in cached.pop("notes").items():
                 ctx.notes_summary.setdefault(source, summary)
             # --apply-defaults writes the trial as measured, so a cache hit must leave its matched gain in the variant too.
@@ -958,11 +962,11 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
         read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
         for source, summary in read.items():
             ctx.notes_summary.setdefault(source, summary)
-        payload = json.dumps(evaluated | {"notes": read, "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))})
-        write_atomic(path, payload)
-        found = incremental.finish(trace, variants.signal_keys, pristine, static, json.loads(payload))
+        payload = evaluated | {"notes": read, "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))}
+        write_atomic(path, incremental.seal(payload))
+        found = incremental.finish(trace, variants.signal_keys, pristine, static, json.loads(json.dumps(payload)))
         if found is not None:
-            write_atomic(trace_path(variants, master_mode, record), json.dumps(found))
+            write_atomic(trace_path(variants, master_mode, record), incremental.seal(found))
         out.append(verdict(entry, evaluated))
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
