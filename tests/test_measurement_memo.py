@@ -38,8 +38,8 @@ def test_battery_json_is_byte_identical_to_main(signal):
     for _ in range(2):
         result = SimpleNamespace(rate=rate, mix=audio.copy(), tapped={"kick": audio.copy(), "bass": audio * 0.7},
                                  master_steps=[{}], master=lambda signal: (signal.copy(), signal * 0.8))
-        numbers, _ = evidence.battery({"sections": sections}, result, points, {"kick": times},
-                                     {"kick": ["kick"], "bass": ["bass"]}, None)
+        numbers = evidence.battery({"sections": sections}, result, points, {"kick": times},
+                                   {"kick": ["kick"], "bass": ["bass"]}, evidence.Master(result, None))
         assert json.dumps(numbers, separators=(",", ":")).encode() == expected
 
 

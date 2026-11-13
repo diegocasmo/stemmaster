@@ -72,7 +72,35 @@ def fingerprint(*parts):
         if isinstance(value, (list, tuple)):
             return [plain(v) for v in value]
         return value
-    return hashlib.sha256(json.dumps(plain(list(parts)), sort_keys=True).encode()).hexdigest()
+    # Dict order is kept: render sums stems, orders buses and applies settings in recipe order.
+    return hashlib.sha256(json.dumps(plain(list(parts))).encode()).hexdigest()
+
+
+TEXT = {"note", "reason", "review", "tool_reason", "chain_reason", "split_reason", "role_reason"}
+
+
+def untext(entry):
+    return {key: value for key, value in entry.items() if key not in TEXT}
+
+
+def numeric(recipe):
+    """The recipe as renders and readings see it: no moves, notes, reviews or reasons."""
+    out = {key: value for key, value in recipe.items() if key not in ("moves", "notes", "reviews")}
+    if "steps" in out:
+        out["steps"] = [untext(step) for step in out["steps"]]
+    if "sources" in out:
+        out["sources"] = {name: untext(source) for name, source in out["sources"].items()}
+    return out
+
+
+def record_part(record):
+    """A record as its contract reads it. An override's presence and leaves decide the outcome, its reason does not."""
+    out = untext(record)
+    if isinstance(out.get("override"), dict):
+        out["override"] = dict(out["override"], reason="reason" in out["override"])
+    if isinstance(out.get("trial"), dict) and "steps" in out["trial"]:
+        out["trial"] = dict(out["trial"], steps=[untext(step) for step in out["trial"]["steps"]])
+    return out
 
 
 def off_variant(recipe, record):
@@ -204,7 +232,32 @@ def observe(audio, rate, hits, sections):
     return entry
 
 
-def battery(recipe, result, points, times, chain_nodes, target):
+class Master:
+    """A render's trial master, made on first read: matching it to the target runs the master chain several times."""
+
+    def __init__(self, result, target):
+        self.result, self.target, self.made = result, target, None
+
+    def make(self):
+        if self.made is None:
+            if self.target is None:
+                master_in, trial = self.result.master(self.result.mix)
+                self.made = {"drive_change_db": 0.0, "matched": False}, master_in, trial
+            else:
+                self.made = matched_master(self.result, self.target)
+        return self.made
+
+    def get(self, name):
+        if not self.result.master_steps:
+            return None
+        # An unmatched master is never read, so it is made only for the battery's numbers.
+        if name == "matched" and self.target is None:
+            return False
+        numbers, master_in, trial = self.make()
+        return {"matched": numbers["matched"], "trial": trial, "master-in": master_in}[name]
+
+
+def battery(recipe, result, points, times, chain_nodes, master):
     rate, out = result.rate, {}
     for label, (tap, hits) in points.items():
         out[label] = observe(result.tapped[tap], rate, hits, recipe.get("sections"))
@@ -224,19 +277,16 @@ def battery(recipe, result, points, times, chain_nodes, target):
             out[f"overlap.{first}.{second}.on_{on_hits}_hits"] = measure.overlap(*pair, rate, bands, inside)
     if not result.master_steps:
         out["trial"] = {"skipped": "no master steps"}
-        return out, {}
-    if target is None:
-        master_in, trial = result.master(result.mix)
-        out["trial"] = {"drive_change_db": 0.0, "matched": False}
-    else:
-        out["trial"], master_in, trial = matched_master(result, target)
+        return out
+    numbers, master_in, trial = master.make()
+    out["trial"] = dict(numbers)
     out["trial"] |= {"integrated_lufs": measure.rounded(loudness(trial, rate)),
                      "true_peak_dbtp": measure.rounded(render.true_peak_dbtp(trial))}
     for chain in ("kick", "snare"):
         if len(times.get(chain, [])):
             out["trial"][f"dip_{chain}"] = measure.dip(master_in, trial, rate, times[chain])
     out["trial"]["range"] = measure.profile_range(trial, rate, recipe.get("profile"))
-    return out, {"trial": trial, "master-in": master_in, "matched": out["trial"]["matched"]}
+    return out
 
 
 def plan(recipe, song, nodes):
@@ -294,14 +344,17 @@ def node_memo():
 
 
 class Variants:
+    """A view renders its variant. A battery is measured only for a key the report publishes, and a matched master only
+    when a reading or a battery needs one."""
 
-    def __init__(self, recipe, song, cache, layout, boundary, outside, ctx, taps):
+    def __init__(self, recipe, song, cache, layout, boundary, outside, ctx, taps, published):
         self.recipe, self.song, self.cache, self.layout = recipe, song, cache, layout
         self.boundary, self.outside, self.ctx, self.taps = boundary, outside, ctx, taps
         self.views, self.batteries, self.probes = {}, {}, {}
         self.recipes = {"current": recipe}
         self.target = ctx.target
         self.memo = node_memo()
+        self.published = set(published)
 
     def add(self, key, variant, probes=None):
         self.recipes.setdefault(key, variant)
@@ -311,7 +364,7 @@ class Variants:
 
     def battery_path(self, key):
         points, chain_times, chain_nodes = self.layout
-        return self.cache / f"{fingerprint(self.recipes[key], self.target, self.boundary, self.outside, points, chain_times, chain_nodes)}.json"
+        return self.cache / f"{fingerprint(numeric(self.recipes[key]), self.target, self.boundary, self.outside, points, chain_times, chain_nodes)}.json"
 
     def battery(self, key):
         if key not in self.batteries:
@@ -319,8 +372,17 @@ class Variants:
             if path.exists():
                 self.batteries[key] = json.loads(path.read_text())
             else:
-                self.view(key)
+                view = self.view(key)
+                numbers = battery(self.recipe, view.result, *self.layout, view.master)
+                path.write_text(json.dumps(numbers))
+                self.batteries[key] = numbers
         return self.batteries[key]
+
+    def drop(self, key):
+        # A published battery is measured before its render goes, so it never needs a second render.
+        if key in self.published:
+            self.battery(key)
+        del self.views[key]
 
     def view(self, key):
         if key in self.views:
@@ -328,7 +390,7 @@ class Variants:
         # The current view stays; the others are dropped oldest first, since each render holds every tap.
         others = [k for k in self.views if k != "current"]
         while len(others) >= MAX_VIEWS - 1:
-            del self.views[others.pop(0)]
+            self.drop(others.pop(0))
         variant = self.recipes[key]
         plugins = {step.get("id"): step["plugin"] for step in variant.get("steps", [])}
         probe = {"Duck": outcome_tools.duck_depth, "Ride": outcome_tools.gain_change, "Gain": outcome_tools.gain_change,
@@ -337,11 +399,24 @@ class Variants:
         taps = sorted(({tap for tap, _ in self.layout[0].values()} | self.taps) & set(render.sources(variant)))
         result = render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary, probes=probes,
                                memo=self.memo)
-        numbers, master = battery(self.recipe, result, *self.layout, self.target)
-        self.battery_path(key).write_text(json.dumps(numbers))
-        self.batteries[key] = numbers
+        points, _, chain_nodes = self.layout
+        # A battery reads every observation tap, so a variant that loses one fails here even when none is measured.
+        for tap in [tap for tap, _ in points.values()] + [node for first, second, _, _ in OVERLAPS for chain in (first, second)
+                                                          for node in chain_nodes.get(chain, [])]:
+            result.tapped[tap]
+        master = Master(result, self.target)
+        if set(probes) & {step.get("id") for step in result.master_steps}:
+            # Each master pass rewrites its steps' probes, so the matched master runs first, before any other pass.
+            master.make()
+        else:
+            # A master no reading needs may never run, yet its bad settings must still fail here.
+            for step in result.master_steps:
+                if step["plugin"] not in render.NATIVE:
+                    render.load(step)
         view = outcome_tools.View(self.ctx, result, master, variant)
-        view.probed = result.mixer.probed
+        # A copy: a later master render (a contract reading the actual master) writes its probes into the mixer, and
+        # every contract must read the same matched-drive probes whatever order the contracts run in.
+        view.probed = dict(result.mixer.probed)
         view.twin = lambda other: self.view(self.add(recipe_key(other), other))
         self.views[key] = view
         RENDERS[0] += 1
@@ -597,7 +672,7 @@ def off_key(recipe, record):
 def recipe_key(variant):
     # Keyed by the recipe itself: a step id may equal another record's field path, and two roles (no-send and
     # no-delay) may need the very same render.
-    return f"recipe:{fingerprint(variant)}"
+    return f"recipe:{fingerprint(numeric(variant))}"
 
 
 def contract_report(recipe, song, nodes, variants, ctx, master_mode):
@@ -605,6 +680,7 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
     records = [r for r in recipe.get("moves", []) if r.get("move") != "balance"
                and (master_mode or not str(r.get("move")).startswith("master."))]
     fact = facts(recipe, routing, ctx, records)
+    active = sorted({json.dumps([r.get("move"), r.get("decision")]) for r in records})
     steps = {step.get("id"): step for step in recipe.get("steps", [])}
     entries = []
     for record in records:
@@ -646,10 +722,19 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
     for done, entry in enumerate(ordered, 1):
         progress(f"contract {done}/{len(ordered)}")
         record, keys = entry["record"], entry["keys"]
-        path = variants.cache / f"contract-{fingerprint(record, entry['contract'], {r: variants.recipes[k] for r, k in keys.items()}, variants.outside, ctx.times, ctx.target, master_mode)}.json"
+        variant_parts = {role: numeric(variants.recipes[key]) for role, key in keys.items()}
+        # Taps come from every record, and a reading of an untapped name is None, so they are part of every key.
+        key = fingerprint(record_part(record), entry["contract"], variant_parts, numeric(recipe), active,
+                          sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
+        path = variants.cache / f"contract-{key}.json"
         if path.exists():
-            out.append(json.loads(path.read_text()))
+            cached = json.loads(path.read_text())
+            for source, summary in cached.pop("notes").items():
+                ctx.notes_summary.setdefault(source, summary)
+            # The key leaves out text, so text comes from the current record, never the cache.
+            out.append(cached | {"override": record.get("override")})
             continue
+        ctx.notes_read = []
         compare = entry["contract"].get("compare")
         if compare == "alt" and "with" in keys:
             with_key = keys["with"]
@@ -703,7 +788,11 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
         result["read_at"] = ctx.acting
         ctx.acting = ctx.join_recipe = ctx.record = None
         ctx.trial_ids = []
-        path.write_text(json.dumps(result))
+        # The sources this record read, in first-read order, so a cache hit adds them to the report as a cold run would.
+        read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
+        for source, summary in read.items():
+            ctx.notes_summary.setdefault(source, summary)
+        path.write_text(json.dumps(result | {"notes": read}))
         out.append(result)
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
@@ -746,13 +835,9 @@ def report(recipe, song, nodes, master_mode=False):
     boundary = masters[-1].get("id") if masters else None
     ctx = outcome_tools.Context(recipe, song, nodes, Routing(recipe), times)
     records_all = [r for r in recipe.get("moves", []) if r.get("move") != "balance"]
-    variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all))
     progress(f"report on {len(records_all)} moves")
-    contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
-    current = variants.battery("current")
-    records = []
-    measured = [r for r in records_all if r.get("decision") in ("kept", "changed")]
     kinds = {field: kind for field, (_, kind) in fields_of(recipe).items()}
+    records = []
     for record in records_all:
         if record.get("decision") not in ("kept", "changed"):
             continue
@@ -761,14 +846,21 @@ def report(recipe, song, nodes, master_mode=False):
         kept_on = [field for field in record.get("fields", []) if kinds.get(field, field.rsplit(".", 1)[-1]) in ("gain_db", "bus")]
         if kept_on:
             entry["kept_on_in_off"] = kept_on
-        progress(f"off {len(records) + 1}/{len(measured)}")
         if not record.get("steps") and len(kept_on) == len(record.get("fields", [])):
             entry["off"] = {"skipped": "claims only gain_db or bus, which have no off state"}
         else:
-            entry["off"] = variants.battery(off_key(recipe, record))
+            entry["off"] = off_key(recipe, record)
         records.append(entry)
+    published = {"current"} | {entry["off"] for entry in records if isinstance(entry["off"], str)}
+    variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all), published)
+    contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
+    current = variants.battery("current")
+    for done, entry in enumerate(records, 1):
+        progress(f"off {done}/{len(records)}")
+        if isinstance(entry["off"], str):
+            entry["off"] = variants.battery(entry["off"])
     numbers = {"timing_stems": timing_stems, "hits": counts, "windows": windows_summary(ctx), "questions": intent_questions(recipe, song, ctx),
-               "notes": notes_summary(ctx), "current": current, "records": records, "contracts": contract}
+               "notes": source_order(recipe, ctx.notes_summary), "current": current, "records": records, "contracts": contract}
     (cache / "report.json").write_text(json.dumps(numbers, indent=1))
     (cache / "report.md").write_text(markdown(numbers))
     return cache / "report.md", numbers
@@ -809,8 +901,10 @@ def windows_summary(ctx):
     return out
 
 
-def notes_summary(ctx):
-    return {source: notes_tool_summary(found) for source, found in ctx.notes.items()}
+def source_order(recipe, summary):
+    # Contracts run in cache-key order, which says nothing about the song, so the report lists sources as the recipe does.
+    order = {source: i for i, source in enumerate(recipe.get("sources", {}))}
+    return dict(sorted(summary.items(), key=lambda item: order[item[0]]))
 
 
 def notes_tool_summary(found):

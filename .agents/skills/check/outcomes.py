@@ -131,6 +131,8 @@ class Context:
         self.roles = {name: {stem: source["role"] for stem in source.get("stems", [])} if source.get("chain") == "synths"
                       and source.get("role") else roles_of(source) for name, source in self.sources.items()}
         self.notes = {}
+        self.notes_read = []
+        self.notes_summary = {}
         self._windows = {}
         # Set while one record is read: its shared bus, if its steps act past its own node, and the recipe
         # (with the move on) whose routing decides where its dry and wet paths sum.
@@ -171,6 +173,10 @@ class Context:
                 placed = render.place(audio, self.recipe["stems"][stem].get("offset_samples", 0), self.length)
                 found.append(note_tools.measure(placed, self.rate, note_tools.onsets(placed, self.rate)))
             self.notes[source] = {"performances": found}
+        # Listed on every read, not only the first: a cached contract must replay every source it reads. A failed
+        # read raises before this, so it adds nothing to the summary, as a cold run would.
+        if source not in self.notes_read:
+            self.notes_read.append(source)
         return self.notes[source]
 
     def events(self, name, source):
