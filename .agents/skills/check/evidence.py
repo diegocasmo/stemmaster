@@ -22,6 +22,7 @@ from memo import memoized
 
 import contracts
 import outcomes as outcome_tools
+import workers
 from structure import CLAIMED_FIELDS, DRUM_CHAINS, Routing, apply_patch, fields_of, roles_of as structure_roles
 
 ATTACK_HIT_MS = (0, 25)
@@ -326,6 +327,13 @@ def progress(message):
     print(f"check: {message}, {time.monotonic() - STARTED:.0f} s", file=sys.stderr, flush=True)
 
 
+def write_atomic(path, text):
+    # Worker processes write the same cache files the check reads, and one killed mid-write must leave no torn file.
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp.write_text(text)
+    os.replace(temp, path)
+
+
 def node_memo():
     megabytes = os.environ.get("STEMMASTER_NODE_MEMO_MB", str(render.MEMO_BYTES >> 20))
     try:
@@ -355,6 +363,7 @@ class Variants:
         self.target = ctx.target
         self.memo = node_memo()
         self.published = set(published)
+        self.contracts = None
 
     def add(self, key, variant, probes=None):
         self.recipes.setdefault(key, variant)
@@ -374,7 +383,7 @@ class Variants:
             else:
                 view = self.view(key)
                 numbers = battery(self.recipe, view.result, *self.layout, view.master)
-                path.write_text(json.dumps(numbers))
+                write_atomic(path, json.dumps(numbers))
                 self.batteries[key] = numbers
         return self.batteries[key]
 
@@ -675,13 +684,12 @@ def recipe_key(variant):
     return f"recipe:{fingerprint(numeric(variant))}"
 
 
-def contract_report(recipe, song, nodes, variants, ctx, master_mode):
-    routing = Routing(recipe)
+def contract_entries(recipe, variants, ctx, master_mode):
+    """Each record's contract and variant keys, made once per Variants: the taps they add are in every contract's key."""
+    if variants.contracts is not None:
+        return variants.contracts
     records = [r for r in recipe.get("moves", []) if r.get("move") != "balance"
                and (master_mode or not str(r.get("move")).startswith("master."))]
-    fact = facts(recipe, routing, ctx, records)
-    active = sorted({json.dumps([r.get("move"), r.get("decision")]) for r in records})
-    steps = {step.get("id"): step for step in recipe.get("steps", [])}
     entries = []
     for record in records:
         entry = {"record": record, "contract": contracts.CONTRACTS[record["move"]], "keys": {}}
@@ -716,17 +724,33 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
             variants.taps.update(ctx.own_returns(entry["record"]["source"]))
     ctx.join_recipe = None
     variants.taps.discard(None)
+    variants.contracts = records, entries
+    return variants.contracts
+
+
+def contract_path(recipe, variants, ctx, master_mode, records, entry):
+    active = sorted({json.dumps([r.get("move"), r.get("decision")]) for r in records})
+    variant_parts = {role: numeric(variants.recipes[key]) for role, key in entry["keys"].items()}
+    # Taps come from every record, and a reading of an untapped name is None, so they are part of every key.
+    key = fingerprint(record_part(entry["record"]), entry["contract"], variant_parts, numeric(recipe), active,
+                      sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
+    return variants.cache / f"contract-{key}.json"
+
+
+def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
+    """Every record's contract outcome; with `only`, just those (move, source) records, for a worker to cache."""
+    records, entries = contract_entries(recipe, variants, ctx, master_mode)
+    routing = Routing(recipe)
+    fact = facts(recipe, routing, ctx, records)
     out = []
     # Records that share a variant run together, so each render is made once and dropped once.
     ordered = sorted(entries, key=lambda e: str(e["keys"].get("without", "")) + str(e["keys"].get("with", "")))
     for done, entry in enumerate(ordered, 1):
-        progress(f"contract {done}/{len(ordered)}")
         record, keys = entry["record"], entry["keys"]
-        variant_parts = {role: numeric(variants.recipes[key]) for role, key in keys.items()}
-        # Taps come from every record, and a reading of an untapped name is None, so they are part of every key.
-        key = fingerprint(record_part(record), entry["contract"], variant_parts, numeric(recipe), active,
-                          sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
-        path = variants.cache / f"contract-{key}.json"
+        if only is not None and (record["move"], record["source"]) not in only:
+            continue
+        progress(f"contract {done}/{len(ordered)}")
+        path = contract_path(recipe, variants, ctx, master_mode, records, entry)
         if path.exists():
             cached = json.loads(path.read_text())
             for source, summary in cached.pop("notes").items():
@@ -792,7 +816,7 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
         read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
         for source, summary in read.items():
             ctx.notes_summary.setdefault(source, summary)
-        path.write_text(json.dumps(result | {"notes": read}))
+        write_atomic(path, json.dumps(result | {"notes": read}))
         out.append(result)
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
@@ -826,16 +850,14 @@ def engaged(view, step_ids, recipe):
     return {step["id"]: view.probed.get(step["id"], {}).get("residual_db") for step in judged}
 
 
-def report(recipe, song, nodes, master_mode=False):
-    cache = song / "renders" / "check"
-    cache.mkdir(parents=True, exist_ok=True)
-    points, chain_times, chain_nodes, timing_stems, counts, times = plan(recipe, song, nodes)
+def prepare(recipe, song, nodes, planned, outside):
+    """The check's variants, context and published records, built the same way in the check and in each worker."""
+    points, chain_times, chain_nodes, timing_stems, counts, times = planned
     layout = (points, chain_times, chain_nodes)
     masters = [step for step in recipe.get("steps", []) if step.get("stage") == "master"]
     boundary = masters[-1].get("id") if masters else None
     ctx = outcome_tools.Context(recipe, song, nodes, Routing(recipe), times)
     records_all = [r for r in recipe.get("moves", []) if r.get("move") != "balance"]
-    progress(f"report on {len(records_all)} moves")
     kinds = {field: kind for field, (_, kind) in fields_of(recipe).items()}
     records = []
     for record in records_all:
@@ -852,7 +874,20 @@ def report(recipe, song, nodes, master_mode=False):
             entry["off"] = off_key(recipe, record)
         records.append(entry)
     published = {"current"} | {entry["off"] for entry in records if isinstance(entry["off"], str)}
-    variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all), published)
+    cache = song / "renders" / "check"
+    variants = Variants(recipe, song, cache, layout, boundary, outside, ctx, contract_taps(ctx, records_all), published)
+    return variants, ctx, records
+
+
+def report(recipe, song, nodes, master_mode=False):
+    cache = song / "renders" / "check"
+    cache.mkdir(parents=True, exist_ok=True)
+    planned = plan(recipe, song, nodes)
+    outside = inputs(song, recipe)
+    variants, ctx, records = prepare(recipe, song, nodes, planned, outside)
+    progress(f"report on {sum(r.get('move') != 'balance' for r in recipe.get('moves', []))} moves")
+    workers.prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx)
+    timing_stems, counts = planned[3], planned[4]
     contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
     current = variants.battery("current")
     for done, entry in enumerate(records, 1):
