@@ -199,13 +199,13 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
     units.sort(key=lambda unit: min(rank.of(record) for record in unit[1]))
     chosen, deferred, level, busy, busy_nodes = [], [], None, set(), set()
     out = copy.deepcopy(recipe)
-    for unit in units:
+    for i, unit in enumerate(units):
         records = unit[1]
         sources = {record["source"] for record in records}
         unit_level = min(rank.level(record) for record in records)
         acted = nodes_of(recipe, unit[0], records, patches)
         if (level is not None and unit_level > level) or sources & busy or rank.upstream(sources) & busy \
-                or acted & busy_nodes:
+                or acted & busy_nodes or rank.ahead(records, [r for later in units[i + 1:] for r in later[1]]):
             deferred += [(record, "waits for " + ("a lower level's changes" if level is not None and unit_level > level
                                                    else "a change before it in signal order")) for record in records]
             continue
@@ -256,10 +256,33 @@ def nodes_of(recipe, kind, records, patches):
             found |= field_names(recipe, claims_of(recipe, patch)[1]) | set(patch.get("buses", {}))
         found |= {steps[i]["target"] for i in record.get("steps", []) if i in steps}
         found |= field_names(recipe, record.get("fields", []))
+        fields = record.get("fields", []) + (claims_of(recipe, patches[id(record)][1])[1] if kind == "keep" else [])
+        # A send reaches its return and the return's own processing: its readings go through them.
+        found |= returns(recipe, {field.rsplit(".sends.", 1)[1] for field in fields if ".sends." in field})
         stems = [stem for stem in recipe.get("sources", {}).get(record["source"], {}).get("stems", []) if stem in recipe["stems"]]
         if stems:
             found.add(structure.node_of(routing, stems))
+    if kind == "drop":
+        # The returns a drop prunes go with it.
+        found |= set(recipe.get("buses", {})) - set(drop_claims(recipe, records).get("buses", {}))
     return found - {None, "mix"}
+
+
+def returns(recipe, buses):
+    """These buses and every bus they feed, through routing and sends, that carries only what they carry."""
+    routing = Routing(recipe)
+    carried = set().union(*(routing.stems_into(bus) for bus in buses)) if buses else set()
+    found, todo = set(), list(buses)
+    while todo:
+        bus = todo.pop()
+        if bus in found or bus == "mix":
+            continue
+        found.add(bus)
+        settings = recipe.get("buses", {}).get(bus, {})
+        for following in [settings.get("bus", "mix")] + [send["bus"] for send in settings.get("sends", [])]:
+            if following != "mix" and routing.stems_into(following) <= carried:
+                todo.append(following)
+    return found
 
 
 def placed(recipe, variant):
@@ -303,6 +326,7 @@ class Order:
         reach = {source: self.reachable(source) for source in sources}
         part = {source: frozenset(s for s in sources if s == source or (s in reach[source] and source in reach[s]))
                 for source in sources}
+        self.part = part
         parts = sorted(set(part.values()), key=lambda p: min(map(tie, p)))
         before = {p: {part[key] for key in sources for target in self.edges.get(key, ()) if part[target] == p and part[key] != p}
                   for p in parts}
@@ -330,6 +354,19 @@ class Order:
                     found.add(target)
                     todo.append(target)
         return found
+
+    def ahead(self, records, later):
+        """Whether a shared group would run ahead of one of its members' order: a later change, on the same level, keys
+        a Duck on a member's source or comes before the member in that source's chain."""
+        for member in records:
+            # Sources on one Duck cycle keep README's order among themselves, so they don't wait for each other here.
+            keys = self.upstream({member["source"]}) - self.part.get(member["source"], frozenset())
+            for other in later:
+                if self.level(other) != self.level(member):
+                    continue
+                if other["source"] in keys or (other["source"] == member["source"] and self.of(other) < self.of(member)):
+                    return True
+        return False
 
     def upstream(self, sources):
         """Every source whose output a Duck in these sources is keyed on, directly or through other Ducks."""

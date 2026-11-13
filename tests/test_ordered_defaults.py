@@ -218,3 +218,40 @@ def test_a_shared_bus_takes_one_change_per_round():
     # On its own stem, tom2's change shares no node with tom1's and goes in the same round.
     _, changes, _, deferred = tom_bus("Tom2.wav")
     assert sorted(r["source"] for r, _ in changes) == ["tom1", "tom2"] and deferred == []
+
+
+def test_a_kept_send_and_a_drop_on_its_return_never_go_in_one_round():
+    """snare's trial sends into the shared return `verb`, whose reverb tom1's record claims and drops: written in one
+    round, the snare's kept send would feed an empty return it was never measured through."""
+    recipe = {"stems": {"Snare.wav": {}, "Tom1.wav": {"sends": [{"bus": "verb", "gain_db": -12}]}},
+              "buses": {"verb": {}},
+              "sources": {"snare": {"chain": "snare", "stems": ["Snare.wav"]}, "tom1": {"chain": "toms", "stems": ["Tom1.wav"]}},
+              "steps": [step("rv", "verb", "Reverb", dry_level=0, wet_level=0.3)],
+              "moves": [{"move": "snare.reverb", "source": "snare", "decision": "dropped", "note": "n",
+                         "trial": {"sends": {"Snare.wav": [{"bus": "verb", "gain_db": -12}]}}},
+                        {"move": "toms.reverb", "source": "tom1", "decision": "kept", "steps": ["rv"],
+                         "fields": ["stems.Tom1.wav.sends.verb"], "note": "n"}]}
+    variant = structure.apply_patch(recipe, recipe["moves"][0]["trial"])
+    numbers = {"contracts": [contract("snare.reverb", "snare", "dropped", "kept", with_key="v"),
+                             contract("toms.reverb", "tom1", "kept", "dropped", needed="false")]}
+    new, changes, _, deferred = defaults.decide(recipe, numbers, Recipes({"v": variant}))
+    assert [r["move"] for r, _ in changes] == ["snare.reverb"] and [r["move"] for r, _ in deferred] == ["toms.reverb"]
+    assert [s["id"] for s in new["steps"]] == ["rv"] and new["stems"]["Snare.wav"]["sends"] == [{"bus": "verb", "gain_db": -12}]
+
+
+def test_a_shared_drop_group_waits_for_the_key_of_a_members_duck():
+    """a and c share one EQ on their rhythm bus; b keys a Duck on c. The group sorts at a, but it must not change c
+    before b."""
+    recipe = {"stems": {"A.wav": {"bus": "rh"}, "B.wav": {}, "C.wav": {"bus": "rh"}}, "buses": {"rh": {}},
+              "sources": {name: {"chain": "guitars", "stems": [f"{name.upper()}.wav"]} for name in ("a", "b", "c")},
+              "steps": [step("shared-eq", "rh", "PeakFilter"), step("b-eq", "B.wav", "PeakFilter"),
+                        step("c-duck", "C.wav", "Duck", key="B.wav")],
+              "moves": [{"move": "guitars.mud-cut", "source": name, "decision": "kept", "steps": [ids], "note": "n"}
+                        for name, ids in (("a", "shared-eq"), ("b", "b-eq"), ("c", "shared-eq"))]}
+    numbers = {"contracts": [contract("guitars.mud-cut", name, "kept", "dropped", needed="false") for name in ("a", "b", "c")]}
+    _, changes, _, deferred = defaults.decide(recipe, numbers, Recipes({}))
+    assert [r["source"] for r, _ in changes] == ["b"] and sorted(r["source"] for r, _ in deferred) == ["a", "c"]
+    # With b settled, the group goes.
+    numbers["contracts"][1]["outcome"] = "kept"
+    _, changes, _, _ = defaults.decide(recipe, numbers, Recipes({}))
+    assert sorted(r["source"] for r, _ in changes) == ["a", "c"]
