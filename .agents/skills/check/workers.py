@@ -26,6 +26,10 @@ POLL_S = 1.0
 BASE_BYTES = 600 << 20
 TAP_SIGNALS = 1.0
 PEAKS = "workers.json"
+# A process keeps taps in memory up to this share of what its part of the memory above the floor leaves over its
+# estimate; the rest is margin, so workers filling their budgets don't push free memory onto the floor.
+BUDGET_SHARE = 0.5
+BUDGET_ENV = "STEMMASTER_SPILL_BUDGET_MB"
 # Named for the code that measured it: a peak measured while every tap was held says nothing about this code's.
 FACTOR = "per_tapped_signal_spilled"
 _STATE = {}
@@ -65,13 +69,37 @@ def estimate(cache, signal_bytes, taps):
     return BASE_BYTES + max(TAP_SIGNALS, recorded(cache)) * signal_bytes * taps
 
 
-def record(cache, signal_bytes, taps, peaks):
-    """Keeps this song's largest worker peak per tapped signal. Bookkeeping only: it never fails the check."""
+def sizes(recipe, variants, ctx):
+    """One whole-song signal's bytes and the number of taps a render holds."""
+    import render
+
+    taps = len(({tap for tap, _ in variants.layout[0].values()} | variants.taps) & set(render.sources(recipe)))
+    return ctx.length * 2 * 8, taps
+
+
+def budget(need, n, free=None, total=None):
+    """Bytes of taps each of n processes keeps in memory before spilling to disk; 0 if free memory is unknown."""
+    override = os.environ.get(BUDGET_ENV)
+    if override is not None:
+        try:
+            return max(0, int(override)) << 20
+        except ValueError:
+            sys.exit(f"{BUDGET_ENV} must be a whole number of MB (0 keeps only a few taps in memory), not {override!r}")
+    free = free_fraction() if free is None else free
+    if free is None:
+        return 0
+    spare = (free - FREE_FLOOR) * (total or total_bytes())
+    return max(0, int(BUDGET_SHARE * (spare / n - need)))
+
+
+def record(cache, signal_bytes, taps, peaks, held=0):
+    """Keeps this song's largest worker peak per tapped signal, leaving out the taps its budget let it hold.
+    Bookkeeping only: it never fails the check."""
     import evidence
 
     try:
         if peaks and signal_bytes * taps:
-            per_signal = max(recorded(cache), (max(peaks) - BASE_BYTES) / (signal_bytes * taps))
+            per_signal = max(recorded(cache), (max(peaks) - held - BASE_BYTES) / (signal_bytes * taps))
             evidence.write_atomic(cache / PEAKS, json.dumps({FACTOR: per_signal, "peak_bytes": max(peaks)}))
     except Exception as error:
         evidence.progress(f"workers: peak not recorded: {error}")
@@ -116,23 +144,23 @@ def parts(recipe, variants, ctx, master_mode):
 
 def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     import evidence
-    import render
 
     todo = parts(recipe, variants, ctx, master_mode)
     if len(todo) < 2:
         return
-    taps = len(({tap for tap, _ in variants.layout[0].values()} | variants.taps) & set(render.sources(recipe)))
-    signal_bytes = ctx.length * 2 * 8
+    signal_bytes, taps = sizes(recipe, variants, ctx)
     need = estimate(variants.cache, signal_bytes, taps)
     n = count(len(todo), need)
     if n < 2:
         return
-    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB")
+    held = budget(need, n)
+    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB "
+                      f"plus {held >> 20} MB of taps kept in memory")
     peaks, pool = [], None
     # The machinery is best effort: whatever goes wrong here, the check computes every missing part itself.
     try:
         pool = futures.ProcessPoolExecutor(n, mp_context=multiprocessing.get_context("spawn"), initializer=_start,
-                                           initargs=(recipe, song, nodes, master_mode, planned, outside))
+                                           initargs=(recipe, song, nodes, master_mode, planned, outside, held))
         waiting, running, names, done = list(todo), set(), {}, 0
         while waiting or running:
             # One more worker per poll, and only while free memory has room for it, so starting them is no burst.
@@ -140,7 +168,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
             if free is None or free < FREE_FLOOR:
                 evidence.progress("workers stopped: free memory " + ("unknown" if free is None else f"{free:.0%} is under {FREE_FLOOR:.0%}"))
                 return
-            if waiting and len(running) < n and (not running or (free - FREE_FLOOR) * total_bytes() >= need):
+            if waiting and len(running) < n and (not running or (free - FREE_FLOOR) * total_bytes() >= need + held):
                 contracts, published = waiting.pop(0)
                 future = pool.submit(_run, contracts, published)
                 running.add(future)
@@ -170,11 +198,14 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                 pool.shutdown(wait=True, cancel_futures=True)
             except Exception as error:
                 evidence.progress(f"workers: shutdown failed: {error}")
-        record(variants.cache, signal_bytes, taps, peaks)
+        record(variants.cache, signal_bytes, taps, peaks, held)
 
 
-def _start(recipe, song, nodes, master_mode, planned, outside):
+def _start(recipe, song, nodes, master_mode, planned, outside, held):
     import evidence
+    import spill
+
+    spill.BUDGET = held
 
     # Only the check prints its report, fails and progress; a worker's error reaches it through its part's result.
     devnull = os.open(os.devnull, os.O_WRONLY)

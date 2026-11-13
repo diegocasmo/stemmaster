@@ -931,6 +931,8 @@ def report(recipe, song, nodes, master_mode=False):
     variants, ctx, records = prepare(recipe, song, nodes, planned, outside)
     progress(f"report on {sum(r.get('move') != 'balance' for r in recipe.get('moves', []))} moves")
     workers.prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx)
+    # Set after the workers are gone, so this process's taps get the whole share above the free floor.
+    spill.BUDGET = workers.budget(workers.estimate(cache, *workers.sizes(recipe, variants, ctx)), 1)
     timing_stems, counts = planned[3], planned[4]
     contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
     current = variants.battery("current")

@@ -7,18 +7,25 @@ import weakref
 
 import numpy as np
 
-# Taps held in memory at once across every store in the process, least recently used spilled first.
+# Taps stay in memory while their bytes fit the budget, or while there are no more than RESIDENT of them; past both,
+# the least recently used go to disk. The check sets the budget from free memory; 0 keeps only RESIDENT taps.
 RESIDENT = 4
+BUDGET = 0
 _LRU = collections.OrderedDict()
+_HELD = [0]
 _SERIAL = itertools.count()
 
 
-def _touch(store, name):
+def _touch(store, name, nbytes):
     key = (store.serial, name)
-    _LRU[key] = weakref.ref(store)
+    if key in _LRU:
+        _HELD[0] -= _LRU[key][1]
+    _LRU[key] = weakref.ref(store), nbytes
+    _HELD[0] += nbytes
     _LRU.move_to_end(key)
-    while len(_LRU) > RESIDENT:
-        (_, old), ref = _LRU.popitem(last=False)
+    while len(_LRU) > RESIDENT and _HELD[0] > BUDGET:
+        (_, old), (ref, size) = _LRU.popitem(last=False)
+        _HELD[0] -= size
         owner = ref()
         if owner is not None:
             owner._spill(old)
@@ -26,7 +33,7 @@ def _touch(store, name):
 
 def _forget(serial):
     for key in [key for key in _LRU if key[0] == serial]:
-        del _LRU[key]
+        _HELD[0] -= _LRU.pop(key)[1]
 
 
 class Taps:
@@ -46,7 +53,7 @@ class Taps:
         self.names[name] = None
         self.resident[name] = audio
         if audio.flags.c_contiguous or audio.flags.f_contiguous:
-            _touch(self, name)
+            _touch(self, name, audio.nbytes)
 
     def _spill(self, name):
         audio = self.resident.get(name)
@@ -94,7 +101,7 @@ class Taps:
         # Held again until it is the least recently used, so a run of reads of one tap reads the file once.
         audio = self._load(name)
         self.resident[name] = audio
-        _touch(self, name)
+        _touch(self, name, audio.nbytes)
         return audio
 
     def get(self, name, default=None):
