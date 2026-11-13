@@ -20,13 +20,27 @@ ENV = "STEMMASTER_CHECK_WORKERS"
 # Kept free for the rest of the machine while workers run.
 FREE_FLOOR = 0.30
 POLL_S = 1.0
-# A worker's peak is its interpreter and plugins plus a few renders, each holding every tap at full length. Song 000's
-# 90 s cut measured 2.28 tapped signals per worker; the default keeps a margin over that.
+# A worker's peak is its interpreter and plugins plus the render it is making: a render's taps, mix and trial master
+# wait on disk, a few at a time in memory. Synthetic songs measured 0.76 tapped signals per worker (2.84 when every tap
+# was held, against song 000's 2.28); the default keeps a margin over that.
 BASE_BYTES = 600 << 20
-TAP_SIGNALS = 2.5
+TAP_SIGNALS = 1.0
 PEAKS = "workers.json"
 # Variant renders done in workers, which the run log adds to the check's own.
 RENDERS = [0]
+# Taps a worker keeps in memory on top of TAP_SIGNALS, so it writes next to nothing to disk: together 2.5 per tap,
+# which covered song 000's 2.28 when every tap was held. Spill writes wear the SSD, so the worker count makes room for
+# them unless STEMMASTER_SPILL_WORKERS=1 trades them for more workers.
+HOLD_SIGNALS = 1.5
+SPILL_ENV = "STEMMASTER_SPILL_WORKERS"
+# Workers get half of what their share of the memory above the floor leaves over their need, as more taps to keep;
+# the rest is margin, so workers filling their budgets don't push free memory onto the floor.
+BUDGET_SHARE = 0.5
+BUDGET_ENV = "STEMMASTER_SPILL_BUDGET_MB"
+# Under this much free memory any process sends its taps to disk, before the workers' monitor stops them at the floor.
+SPILL_FLOOR = FREE_FLOOR + 0.05
+# Named for the code that measured it: a peak measured while every tap was held says nothing about this code's.
+FACTOR = "per_tapped_signal_spilled"
 _STATE = {}
 
 
@@ -54,7 +68,7 @@ def peak_bytes():
 
 def recorded(cache):
     try:
-        return float(json.loads((cache / PEAKS).read_text())["per_tapped_signal"])
+        return float(json.loads((cache / PEAKS).read_text())[FACTOR])
     except Exception:
         return 0.0
 
@@ -64,14 +78,44 @@ def estimate(cache, signal_bytes, taps):
     return BASE_BYTES + max(TAP_SIGNALS, recorded(cache)) * signal_bytes * taps
 
 
+def sizes(recipe, variants, ctx):
+    """One whole-song signal's bytes and the number of taps a render holds."""
+    import render
+
+    taps = len(({tap for tap, _ in variants.layout[0].values()} | variants.taps) & set(render.sources(recipe)))
+    return ctx.length * 2 * 8, taps
+
+
+def hold(signal_bytes, taps):
+    """Bytes of taps a worker keeps in memory on top of its estimate: none when workers may spill."""
+    return 0 if os.environ.get(SPILL_ENV) == "1" else HOLD_SIGNALS * signal_bytes * taps
+
+
+def budget(need, n, keep=0, share=BUDGET_SHARE, free=None, total=None):
+    """Bytes of taps each of n processes keeps in memory before spilling: `keep`, plus `share` of what its part of the
+    memory above the floor leaves over `need`; only `keep` if free memory is unknown."""
+    override = os.environ.get(BUDGET_ENV)
+    if override is not None:
+        try:
+            return max(0, int(override)) << 20
+        except ValueError:
+            sys.exit(f"{BUDGET_ENV} must be a whole number of MB (0 keeps only a few taps in memory), not {override!r}")
+    free = free_fraction() if free is None else free
+    if free is None:
+        return int(keep)
+    spare = (free - FREE_FLOOR) * (total or total_bytes())
+    return int(keep + max(0, share * (spare / n - need)))
+
+
 def record(cache, signal_bytes, taps, peaks):
-    """Keeps this song's largest worker peak per tapped signal. Bookkeeping only: it never fails the check."""
+    """Keeps this song's largest worker peak per tapped signal, its whole resident peak: subtracting the taps it held
+    could understate a worker whose arrays are shared. Bookkeeping only: it never fails the check."""
     import evidence
 
     try:
         if peaks and signal_bytes * taps:
             per_signal = max(recorded(cache), (max(peaks) - BASE_BYTES) / (signal_bytes * taps))
-            evidence.write_atomic(cache / PEAKS, json.dumps({"per_tapped_signal": per_signal, "peak_bytes": max(peaks)}))
+            evidence.write_atomic(cache / PEAKS, json.dumps({FACTOR: per_signal, "peak_bytes": max(peaks)}))
     except Exception as error:
         evidence.progress(f"workers: peak not recorded: {error}")
 
@@ -115,23 +159,24 @@ def parts(recipe, variants, ctx, master_mode):
 
 def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     import evidence
-    import render
 
     todo = parts(recipe, variants, ctx, master_mode)
     if len(todo) < 2:
         return
-    taps = len(({tap for tap, _ in variants.layout[0].values()} | variants.taps) & set(render.sources(recipe)))
-    signal_bytes = ctx.length * 2 * 8
-    need = estimate(variants.cache, signal_bytes, taps)
-    n = count(len(todo), need)
+    signal_bytes, taps = sizes(recipe, variants, ctx)
+    work, keep = estimate(variants.cache, signal_bytes, taps), hold(signal_bytes, taps)
+    n = count(len(todo), work + keep)
     if n < 2:
         return
-    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB")
+    held = budget(work + keep, n, keep)
+    need = work + held
+    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(work) >> 20} MB "
+                      f"plus {held >> 20} MB of taps kept in memory")
     peaks, pool, names = [], None, {}
     # The machinery is best effort: whatever goes wrong here, the check computes every missing part itself.
     try:
         pool = futures.ProcessPoolExecutor(n, mp_context=multiprocessing.get_context("spawn"), initializer=_start,
-                                           initargs=(recipe, song, nodes, master_mode, planned, outside))
+                                           initargs=(recipe, song, nodes, master_mode, planned, outside, held))
         waiting, running, done = list(todo), set(), 0
         while waiting or running:
             # One more worker per poll, and only while free memory has room for it, so starting them is no burst.
@@ -150,7 +195,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                     # The check meets the same error itself, in its own order, when it computes this part.
                     evidence.progress(f"workers stopped: {type(future.exception()).__name__}: {future.exception()}")
                     return
-                peak, seconds, _ = future.result()
+                peak, seconds, _, _ = future.result()
                 peaks.append(peak)
                 done += 1
                 evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future]}... {seconds:.0f} s), worker peak {peak >> 20} MB")
@@ -167,7 +212,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
         for future in names:
             if future.done() and not future.cancelled():
                 error = future.exception()
-                RENDERS[0] += getattr(error, "worker_renders", 0) if error is not None else future.result()[2]
+                RENDERS[0] += getattr(error, "worker_renders", 0) if error is not None else future.result()[3]
         if pool is not None:
             try:
                 pool.kill_workers()
@@ -177,8 +222,11 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
         record(variants.cache, signal_bytes, taps, peaks)
 
 
-def _start(recipe, song, nodes, master_mode, planned, outside):
+def _start(recipe, song, nodes, master_mode, planned, outside, held):
     import evidence
+    import spill
+
+    spill.BUDGET, spill.FREE, spill.FLOOR = held, free_fraction, SPILL_FLOOR
 
     # Only the check prints its report, fails and progress; a worker's error reaches it through its part's result.
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -205,6 +253,7 @@ def _renders():
 
 def _run(contracts, published):
     import evidence
+    import spill
 
     state, started = _STATE, time.monotonic()
     if "refused" in state:
@@ -222,4 +271,4 @@ def _run(contracts, published):
     # Only the current render is shared between parts; the rest would hold memory the next part needs.
     for key in [k for k in variants.views if k != "current"]:
         variants.drop(key)
-    return peak_bytes(), time.monotonic() - started, _renders()
+    return peak_bytes(), time.monotonic() - started, spill.held_at_peak(), _renders()

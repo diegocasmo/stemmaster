@@ -94,18 +94,19 @@ def test_a_failed_worker_part_still_counts_its_renders(tmp_path, monkeypatch):
 def test_a_memory_stop_still_counts_the_parts_that_finished(tmp_path, monkeypatch):
     import workers
 
-    real, submitted, samples = workers.futures.wait, [], []
+    real, submitted = workers.futures.wait, []
 
     def wait(running, **kwargs):
         submitted.extend(running)
         return real(running, timeout=0)
 
     def free():
-        # The second sample comes after the first part finished but before the check read its result.
-        samples.append(None)
+        # Room until a part is submitted; the next sample comes after it finished but before the check read its result.
+        if not submitted:
+            return 0.9
         for future in submitted:
             future.result(timeout=60)
-        return 0.9 if len(samples) == 1 else 0.1
+        return 0.1
 
     monkeypatch.setattr(workers.futures, "wait", wait)
     prewarmed(tmp_path, monkeypatch, [{"move": "bass.hpf", "source": "bass", "decision": "kept", "steps": ["hpf"]},
