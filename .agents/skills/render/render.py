@@ -1,8 +1,19 @@
 import ctypes
+import contextlib
+import hashlib
+import io
 import json
+import marshal
 import math
+import os
+import platform
+import re
+import shutil
 import sys
+import time
+from importlib import metadata
 from pathlib import Path
+from stat import S_ISREG
 
 import numpy as np
 import pedalboard
@@ -57,24 +68,361 @@ def load(step):
     return plugin
 
 
+def apply(audio, rate, step, context):
+    if step["plugin"] in NATIVE:
+        return NATIVE[step["plugin"]](audio, rate, step["settings"], context)
+    plugin = load(step)
+    # Some VST3s accept only stereo, so a mono stem goes through them as two equal channels.
+    mono = audio.shape[1] == 1 and isinstance(plugin, pedalboard.VST3Plugin)
+    stereo = np.repeat(audio, 2, axis=1) if mono else audio
+    # Plugins take (channels, samples); the rest of this file uses (samples, channels).
+    out = plugin(stereo.T.astype(np.float32), rate).T.astype(np.float64)
+    return out.mean(axis=1, keepdims=True) if mono else out
+
+
 def process(audio, rate, steps, target, context):
     for step in steps:
         if step["target"] != target:
             continue
         before = audio
-        if step["plugin"] in NATIVE:
-            audio = NATIVE[step["plugin"]](audio, rate, step["settings"], context)
-        else:
-            plugin = load(step)
-            # Some VST3s accept only stereo, so a mono stem goes through them as two equal channels.
-            mono = audio.shape[1] == 1 and isinstance(plugin, pedalboard.VST3Plugin)
-            stereo = np.repeat(audio, 2, axis=1) if mono else audio
-            # Plugins take (channels, samples); the rest of this file uses (samples, channels).
-            out = plugin(stereo.T.astype(np.float32), rate).T.astype(np.float64)
-            audio = out.mean(axis=1, keepdims=True) if mono else out
+        audio = apply(audio, rate, step, context)
         if step.get("id") in getattr(context, "probes", {}):
             context.probed[step["id"]] = context.probes[step["id"]](before, audio, rate)
     return audio
+
+
+def digest(*parts):
+    # Settings keep their order: parameters are set in that order, and some plugins depend on it.
+    return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+MEMO_BYTES = 20 << 30
+# Left free on the volume, so a full cache folder never starves another process's writes.
+MEMO_SPARE_BYTES = 2 << 30
+MEMO_STALE_NS = 24 * 3600 * 10**9
+MEMO_CHUNK_BYTES = 8 << 20
+
+
+def code_digest(paths):
+    # Per file, so moving code from one file to the next changes it.
+    return digest([[path.name, hashlib.sha256(path.read_bytes()).hexdigest()] for path in paths])
+
+
+def runs_source(module):
+    """False when the bytecode beside the module holds other code than its source: import may have run that instead."""
+    try:
+        cached = getattr(module, "__cached__", None)
+        if not cached or not os.path.exists(cached):
+            return True
+        with open(cached, "rb") as file:
+            code = marshal.loads(file.read()[16:])
+        # Code objects compare by what they run, not by the file name they were compiled under.
+        return code == compile(Path(module.__file__).read_bytes(), code.co_filename, "exec", dont_inherit=True)
+    except Exception:
+        return False
+
+
+# Hashed at import, so the tag names the code this process runs even if the files change on disk later. None when a
+# stale .pyc may be what runs, which turns the memo off.
+CODE = code_digest(Path(__file__).with_name(name) for name in ("render.py", "native.py", "airwindows.py")) \
+    if all(runs_source(module) for module in (sys.modules[__name__], native, airwindows)) else None
+# Only names the memo writes are ever evicted, so a folder shared with other files keeps them.
+MEMO_NAME = re.compile(r"([0-9a-f]{16})-[0-9a-f]{64}(\.npy|\.seen|\.\d+\.tmp)")
+# What an empty file takes on disk, so seen markers count toward the cap.
+MEMO_BLOCK_BYTES = 4096
+MEMO_MARKER_BUDGET_BYTES = 64 << 20
+
+
+def memo_folder():
+    return Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache") / "stemmaster" / "nodes"
+
+
+def layout(audio):
+    # sha256 reads a C-contiguous buffer, and a Fortran-order array's transpose is one.
+    return audio if audio.flags.c_contiguous else audio.T
+
+
+def bundle_files(bundle):
+    """Its files, and its links with their targets: a link can move to another folder with no file changing."""
+    # os.walk follows linked folders (Path.rglob doesn't); a folder already seen by its real path is a cycle or a repeat.
+    seen, files, links = set(), [], []
+    def fail(error):
+        raise error
+
+    # An unreadable folder raises, so the step is uncached instead of keyed without it.
+    for top, folders, names in os.walk(bundle, followlinks=True, onerror=fail):
+        links += [[str(Path(top, name).relative_to(bundle)), "link", os.readlink(Path(top, name))]
+                  for name in folders + names if os.path.islink(Path(top, name))]
+        if os.path.realpath(top) in seen:
+            folders.clear()
+            continue
+        seen.add(os.path.realpath(top))
+        files += [Path(top, name) for name in names]
+    return sorted(files), sorted(links)
+
+
+class Memo:
+    """Step outputs kept on disk across renders, runs and songs, keyed by everything upstream that decides their samples.
+
+    Each output is an .npy file followed by the sha256 of everything before it, so a damaged file is a miss. A file's
+    mtime is its last use. Past the byte cap, files of other code unused for a day go first, then the least recently used.
+    """
+
+    def __init__(self, folder, cap_bytes=MEMO_BYTES, sightings=2):
+        if CODE is None:
+            raise RuntimeError("a .pyc of render.py, native.py or airwindows.py holds other code than its source")
+        # Most outputs are computed once and never asked for again, so with sightings=2 one is stored only on its
+        # second computation; an empty .seen file remembers the first, across runs too. sightings=1 stores on the first.
+        if sightings not in (1, 2):
+            raise ValueError(f"sightings must be 1 or 2, not {sightings!r}")
+        self.folder, self.cap, self.sightings = Path(folder), cap_bytes, sightings
+        # Bytes of markers made since the last eviction: past a small budget they trigger one, so the cap holds even
+        # when nothing is stored.
+        self.marked = 0
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.bundles = {}
+        self.ran = self.reused = 0
+        # Cached files outlive this process, so the code and libraries that computed them are part of every key.
+        # The OS build too: numpy's math and the plugins call system libraries an OS update can change.
+        self.code = [CODE, sys.version, platform.platform(), os.uname().version,
+                     *(metadata.version(name) for name in ("numpy", "scipy", "pedalboard"))]
+        self.tag = digest(self.code)[:16]
+        self.evict()
+
+    def path(self, key):
+        return self.folder / f"{self.tag}-{key}.npy"
+
+    def used(self, path):
+        # The marker is dated with its file, so least recently used eviction takes the file before its marker.
+        with contextlib.suppress(OSError):
+            os.utime(path.with_suffix(".seen"), follow_symlinks=False)
+
+    def get(self, key):
+        path = self.path(key)
+        # Any error is a miss: numpy's header parser can raise almost anything on damaged bytes.
+        try:
+            # Nothing the memo opens or creates follows a link: one planted in the folder could point anywhere. Non
+            # blocking, so a FIFO there can't hang the render; only a regular file is read.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if not S_ISREG(os.fstat(descriptor).st_mode):
+                    return None
+                with open(descriptor, "rb", closefd=False) as file:
+                    size = os.fstat(file.fileno()).st_size
+                    header = file.read(10)
+                    header += file.read(int.from_bytes(header[8:10], "little"))
+                    parsed = io.BytesIO(header)
+                    np.lib.format.read_magic(parsed)
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(parsed)
+                    # Checked before the samples are read, so a damaged file can't ask for more memory than it should.
+                    if (size > self.cap or dtype != np.float64 or not all(type(n) is int and n >= 0 for n in shape)
+                            or len(header) + 8 * math.prod(shape) + 32 != size):
+                        return None
+                    # A header can agree with a damaged file's size, so the hash is checked in bounded reads before
+                    # the samples get memory, then again on the bytes kept.
+                    content, chunk = hashlib.sha256(header), bytearray(MEMO_CHUNK_BYTES)
+                    for start in range(len(header), size - 32, len(chunk)):
+                        read = file.readinto(memoryview(chunk)[: min(len(chunk), size - 32 - start)])
+                        content.update(memoryview(chunk)[:read])
+                    if content.digest() != file.read(32):
+                        return None
+                    file.seek(len(header))
+                    data = bytearray(size - len(header))
+                    if file.readinto(data) != len(data):
+                        return None
+                    content = hashlib.sha256(header)
+                    content.update(memoryview(data)[:-32])
+                    if content.digest() != data[-32:]:
+                        return None
+                    os.utime(descriptor)
+            finally:
+                os.close(descriptor)
+            audio = np.frombuffer(data, np.float64, math.prod(shape))
+            self.used(path)
+        except Exception:
+            return None
+        return audio.reshape(shape, order="F" if fortran else "C")
+
+    def put(self, key, audio):
+        # np.save's format keeps C or Fortran order but not other strides, and later sums can depend on the order.
+        if not (audio.flags.c_contiguous or audio.flags.f_contiguous):
+            return
+        header = io.BytesIO()
+        np.lib.format.write_array_header_1_0(header, np.lib.format.header_data_from_array_1_0(audio))
+        header = header.getvalue()
+        size = len(header) + audio.nbytes + 32
+        path = self.path(key)
+        temp = path.with_name(f"{path.stem}.{os.getpid()}.tmp")
+        try:
+            if size > self.cap or shutil.disk_usage(self.folder).free < size + MEMO_SPARE_BYTES:
+                return
+            if self.sightings > 1:
+                seen = path.with_suffix(".seen")
+                try:
+                    os.close(os.open(seen, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644))
+                    self.marked += MEMO_BLOCK_BYTES
+                    if self.marked > min(self.cap // 100, MEMO_MARKER_BUDGET_BYTES):
+                        self.evict()
+                    return
+                except FileExistsError:
+                    if not S_ISREG(seen.lstat().st_mode):
+                        return
+            content = hashlib.sha256(header)
+            content.update(layout(audio))
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+            try:
+                descriptor = os.open(temp, flags, 0o644)
+            except FileExistsError:
+                # Left by a killed process whose pid this one reuses; unlink removes a link itself, never its target.
+                temp.unlink()
+                descriptor = os.open(temp, flags, 0o644)
+            try:
+                with open(descriptor, "wb") as file:
+                    file.write(header)
+                    file.write(layout(audio))
+                    file.write(content.digest())
+                os.replace(temp, path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    temp.unlink()
+                return
+        except OSError:
+            return
+        self.used(path)
+        self.evict()
+
+    def evict(self):
+        # A future mtime (clock set back, files copied in) would outrank every new file, so it counts as oldest.
+        now, files, newest, self.marked = time.time_ns(), [], {}, 0
+        try:
+            entries = list(os.scandir(self.folder))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if (name := MEMO_NAME.fullmatch(entry.name)) and entry.is_file(follow_symlinks=False):
+                    stat = entry.stat(follow_symlinks=False)
+                    used = stat.st_mtime_ns if stat.st_mtime_ns <= now else 0
+                    tag = name[1]
+                    newest[tag] = max(newest.get(tag, 0), used)
+                    files.append((tag, used, max(stat.st_size, MEMO_BLOCK_BYTES) if name[2] == ".seen" else stat.st_size, entry.path))
+            except OSError:
+                pass
+        # Another worktree's check may be running now, so its files are stale only once it has written nothing for a day.
+        stale = {tag for tag, used in newest.items() if tag != self.tag and used < now - MEMO_STALE_NS}
+        files = [(tag not in stale, used, size, path) for tag, used, size, path in files]
+        total = sum(size for _, _, size, _ in files)
+        for _, _, size, path in sorted(files):
+            if total <= self.cap:
+                break
+            try:
+                os.unlink(path)
+                total -= size
+            except OSError:
+                pass
+
+    def plugin(self, name):
+        # The same check load() makes, so a bundle added or removed between renders changes the key.
+        bundle = PLUGINS / f"{name}.vst3"
+        if not bundle.exists():
+            return ["built-in"]
+        files, links = bundle_files(bundle)
+        # A rewrite changes ctime or inode, and neither can be set back the way size and mtime can.
+        stats = [[str(f.relative_to(bundle)), *((s := f.stat()).st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_ino)]
+                 for f in files] + links
+        found = self.bundles.get(name)
+        if found is None or found[0] != stats:
+            content = []
+            for f in files:
+                with open(f, "rb") as file:
+                    content.append([str(f.relative_to(bundle)), "file", os.fstat(file.fileno()).st_size,
+                                    hashlib.file_digest(file, "sha256").hexdigest()])
+            found = self.bundles[name] = stats, digest(content + links)
+        return ["bundle", found[1]]
+
+    def loader(self, step):
+        """The step's part of its key, and the bundle's file stats, which any change to the bundle alters; None if unknown."""
+        try:
+            if step["plugin"] in NATIVE:
+                return ["native"], None
+            identity = self.plugin(step["plugin"])
+            return identity, self.bundles[step["plugin"]][0] if identity[0] == "bundle" else None
+        except Exception:
+            return None
+
+
+def names_file(step):
+    return step["plugin"] == "Convolution" or any(
+        isinstance(value, str) and ("file" in name.lower() or "path" in name.lower() or os.path.isfile(value))
+        for name, value in step["settings"].items())
+
+
+def step_key(key, step, context, upstream):
+    """None when the step's output can't be keyed: its input can't, it reads a file, or its key node can't."""
+    if key is None or names_file(step):
+        return None
+    plugin = step["plugin"]
+    if plugin == "Ride":
+        upstream = context.sections
+    return None if upstream is None else digest(key, context.memo.code, plugin, step["settings"], upstream)
+
+
+def chain(source, rate, steps, target, context, key):
+    """process() for a node whose input `source()` is identified by `key`, resuming after the longest prefix in context.memo.
+
+    Steps are visited in order, so Duck keys are pulled and probes filled in the same order as process(). From the
+    first step that can't be keyed, every step runs and nothing is kept. Returns the output and its key, or None.
+    """
+    memo, audio, pending, broken = context.memo, None, [], False
+
+    def settle():
+        nonlocal audio, pending, key, broken
+        found, index = None, -1
+        for index in range(len(pending) - 1, -1, -1):
+            if pending[index][1] is not None and (found := memo.get(pending[index][1])) is not None:
+                break
+        # A bundle changed since its loader was taken must load, and fail, as without the memo, so the hit is dropped.
+        if found is not None and any(memo.loader(step) != loader for step, _, loader in pending[: index + 1]):
+            found = None
+        if found is not None:
+            memo.reused += index + 1
+            audio, pending = found, pending[index + 1 :]
+        elif audio is None:
+            audio = source()
+        for step, after, loader in pending:
+            audio = apply(audio, rate, step, context)
+            memo.ran += 1
+            # A bundle changed between this step's key and its load leaves this output, and all built on it, unkeyed.
+            if after is not None and not broken and loader != memo.loader(step):
+                broken, key = True, None
+            if after is not None and not broken:
+                memo.put(after, audio)
+        pending = []
+        return audio
+
+    for step in steps:
+        if step["target"] != target:
+            continue
+        if key is not None and step["plugin"] == "Duck" and step["settings"]["key"] not in context.done:
+            # Pulling a key renders another node, so the steps before it run first, as in process(), and fail in the same order.
+            settle()
+        # Taken once: the same loader builds the key and is checked again after the step runs.
+        loader = memo.loader(step) if key is not None else None
+        upstream = loader and loader[0]
+        if key is not None and step["plugin"] == "Duck":
+            upstream = context.signature(step["settings"]["key"])
+        try:
+            key = step_key(key, step, context, upstream)
+        except Exception:
+            # A step whose key can't be built runs uncached, so it fails or not exactly as in process(), after the steps before it.
+            key = None
+        if step.get("id") in context.probes:
+            before = settle()
+            pending = [(step, key, loader)]
+            context.probed[step["id"]] = context.probes[step["id"]](before, settle(), rate)
+        else:
+            pending.append((step, key, loader))
+    return settle(), key
 
 
 def place(audio, offset, length):
@@ -241,7 +589,7 @@ class Mix:
     without buses, sends or keys keep their exact samples. A keyed step pulls its key forward.
     """
 
-    def __init__(self, recipe, song, rate, length, taps=(), probes=None):
+    def __init__(self, recipe, song, rate, length, taps=(), probes=None, memo=None):
         self.recipe, self.song, self.rate, self.length = recipe, song, rate, length
         self.taps, self.tapped = set(taps), {}
         self.probes, self.probed = probes or {}, {}
@@ -250,18 +598,35 @@ class Mix:
         self.keys = {step["settings"]["key"] for step in recipe.get("steps", []) if step["plugin"] == "Duck"}
         self.feeds = sources(recipe)
         self.sums, self.keyed, self.done = {}, {}, set()
+        # With a memo, each node's output key and each bus's inputs in the order they were summed.
+        self.memo, self.signatures, self.parts = memo, {}, {}
 
-    def add(self, bus, audio):
+    def add(self, bus, audio, part=None):
         self.sums[bus] = self.sums.get(bus, np.zeros((self.length, 2))) + audio
+        self.parts.setdefault(bus, []).append(part)
 
-    def send(self, name, audio, settings):
-        self.add(settings.get("bus", "mix"), audio)
+    def send(self, name, audio, settings, key=None):
+        self.add(settings.get("bus", "mix"), audio, key)
         for send in settings.get("sends", []):
-            self.add(send["bus"], audio * 10 ** (send.get("gain_db", 0) / 20))
+            self.add(send["bus"], audio * 10 ** (send.get("gain_db", 0) / 20), key and [key, send.get("gain_db", 0)])
 
     def key(self, name):
         self.pull(name)
         return self.keyed[name]
+
+    def signature(self, name):
+        self.pull(name)
+        return self.signatures[name]
+
+    def node(self, name, source, key):
+        if self.memo is None:
+            return process(source(), self.rate, self.steps, name, self), None
+        audio, self.signatures[name] = chain(source, self.rate, self.steps, name, self, key)
+        return audio, self.signatures[name]
+
+    def summed(self, name):
+        audio, parts = self.sums.pop(name, np.zeros((self.length, 2))), self.parts.pop(name, [])
+        return (lambda: audio), self.memo and None not in parts and digest("bus", self.rate, self.length, parts) or None
 
     def pull(self, name):
         if name in self.recipe["stems"]:
@@ -274,17 +639,24 @@ class Mix:
             return
         self.done.add(name)
         settings = self.recipe["stems"][name]
-        audio = soundfile.read(self.song / "stems" / name, always_2d=True)[0]
-        audio = audio * 10 ** (settings.get("gain_db", 0) / 20)
-        if settings.get("invert", False):
-            audio = -audio
-        audio = process(place(audio, settings.get("offset_samples", 0), self.length), self.rate, self.steps, name, self)
+        read = soundfile.read(self.song / "stems" / name, always_2d=True)[0]
+
+        def source():
+            audio = read * 10 ** (settings.get("gain_db", 0) / 20)
+            if settings.get("invert", False):
+                audio = -audio
+            return place(audio, settings.get("offset_samples", 0), self.length)
+
+        # The samples read, not the file's stat: a rewrite can keep its size and mtime.
+        start = self.memo and digest("stem", read.shape, hashlib.sha256(read).hexdigest(), settings.get("gain_db", 0),
+                                     settings.get("invert", False), settings.get("offset_samples", 0), self.rate, self.length)
+        audio, key = self.node(name, source, start)
         if name in self.keys:
             self.keyed[name] = audio
         audio = pan(audio, settings.get("pan", 0))
         if name in self.taps:
             self.tapped[name] = audio
-        self.send(name, audio, settings)
+        self.send(name, audio, settings, key and digest(key, "pan", settings.get("pan", 0)))
 
     def bus(self, name):
         if name in self.done:
@@ -293,19 +665,19 @@ class Mix:
         for source, settings in self.feeds.items():
             if name == settings.get("bus", "mix") or name in {send["bus"] for send in settings.get("sends", [])}:
                 self.pull(source)
-        audio = process(self.sums.pop(name, np.zeros((self.length, 2))), self.rate, self.steps, name, self)
+        audio, key = self.node(name, *self.summed(name))
         if name in self.keys:
             self.keyed[name] = audio
         if name in self.taps:
             self.tapped[name] = audio
-        self.send(name, audio, self.feeds[name])
+        self.send(name, audio, self.feeds[name], key)
 
     def render(self):
         for name in self.recipe["stems"]:
             self.stem(name)
         for name in bus_order(self.recipe):
             self.bus(name)
-        return process(self.sums.pop("mix", np.zeros((self.length, 2))), self.rate, self.steps, "mix", self)
+        return self.node("mix", *self.summed("mix"))[0]
 
 
 def master_target(recipe):
@@ -321,12 +693,12 @@ def measure(audio, rate):
 
 
 class Result:
-    def __init__(self, recipe, song, taps=(), strict=True, boundary=None, probes=None):
+    def __init__(self, recipe, song, taps=(), strict=True, boundary=None, probes=None, memo=None):
         self.rate, length = timeline(recipe, song)
         check(recipe, self.rate, length, strict)
         if unknown := set(taps) - set(sources(recipe)) - {MASTER_IN}:
             sys.exit(f"--tap names no stem or bus: {sorted(unknown)}")
-        self.mixer = Mix(recipe, song, self.rate, length, taps, probes)
+        self.mixer = Mix(recipe, song, self.rate, length, taps, probes, memo)
         self.mix = self.mixer.render()
         self.tapped = self.mixer.tapped
         self.master_steps = [step for step in recipe.get("steps", []) if step.get("stage") == "master"]
