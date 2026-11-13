@@ -127,7 +127,8 @@ def report_end(numbers, left, deferred, history, changed_in):
     contradicting = [key for key, c in contracts_now.items()
                      if any(fail.startswith(("the default outcome is", "the trial worked")) for fail in c["fails"])]
     for key in contradicting:
-        if not changed_in.get(key) and len(history.get(key, [])) < 2:
+        # Only a default that moved between rounds flips; a steady one is deferred, left or not applied, and says so.
+        if len({outcome for _, _, outcome, _ in history.get(key, [])}) < 2:
             continue
         rounds = "; ".join(f"round {r}: {decision}, default {outcome} ({values})" for r, decision, outcome, values in history[key])
         others = sorted({f"{move} on {source} (round {r})" for (move, source), rs in changed_in.items() if (move, source) != key

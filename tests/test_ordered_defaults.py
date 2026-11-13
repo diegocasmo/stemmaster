@@ -5,7 +5,7 @@ import check
 import defaults
 import evidence
 import structure
-from test_apply_defaults import chain_recipe, measure, outcomes, song_recipe, step
+from test_apply_defaults import Recipes, chain_recipe, contract, measure, outcomes, song_recipe, step
 
 
 def leaf(leaf_id, value, test, state, measure="band"):
@@ -15,7 +15,7 @@ def leaf(leaf_id, value, test, state, measure="band"):
 def saturate(band, dip):
     """kick.saturate: (band rises > 0.5 or dip falls < -0.5) and attack holds."""
     state = lambda ok: "true" if ok else "false"
-    return {"move": "kick.saturate", "source": "kick", "needed": "true", "worked": "true",
+    return {"move": "kick.saturate", "source": "kick", "needed": "true", "worked": "true", "with": "trial",
             "leaves": [{"id": "needed", "state": "true", "value": None, "text": "always tried"},
                        leaf("worked.0.0", band, "> 0.5", state(band > 0.5)), leaf("worked.0.1", dip, "< -0.5", state(dip < -0.5), "dip"),
                        leaf("worked.1", 0.0, ">= -0.5", "true", "attack_p50")]}
@@ -100,3 +100,98 @@ def test_an_override_edit_reuses_every_contract_and_the_report_is_a_cold_checks(
     assert [(cache / n).read_bytes() for n in ("report.json", "report.md")] == warm
     # The narrower override no longer names every leaf it contradicts, and the cache doesn't hide that.
     assert outcomes(numbers)[("snare.reverb", "snare")]["fails"] == outcomes(cold_numbers)[("snare.reverb", "snare")]["fails"]
+
+
+def two_sources(kick_step, snare_steps, trial_step):
+    return {"stems": {"Kick.wav": {}, "Snare.wav": {}}, "buses": {},
+            "sources": {"kick": {"chain": "kick", "stems": ["Kick.wav"]}, "snare": {"chain": "snare", "stems": ["Snare.wav"]}},
+            "steps": [kick_step, *snare_steps],
+            "moves": [{"move": "kick.limit", "source": "kick", "decision": "kept", "steps": [kick_step["id"]], "note": "n"},
+                      {"move": "snare.compress", "source": "snare", "decision": "dropped", "note": "n",
+                       "trial": {"steps": [trial_step]}}]}
+
+
+def test_a_kept_trial_lands_where_measured_when_another_source_drops_its_anchor_the_same_round():
+    """The trial goes before the snare EQ, which trial_patch writes as after the kick's step: dropped first, the trial
+    would land after the EQ."""
+    for snare_steps, trial in (([step("s-eq", "Snare.wav", "PeakFilter")], dict(step("s-comp", "Snare.wav", "Compressor"), before="s-eq")),
+                               ([step("s-clip", "Snare.wav", "Clipping")], dict(step("s-comp", "Snare.wav", "PeakFilter"), before="s-clip"))):
+        recipe = two_sources(step("kick-lim", "Kick.wav", "Limiter"), snare_steps, trial)
+        variant = structure.apply_patch(recipe, recipe["moves"][1]["trial"])
+        numbers = {"contracts": [contract("kick.limit", "kick", "kept", "dropped", needed="false"),
+                                 contract("snare.compress", "snare", "dropped", "kept", with_key="v")]}
+        new, changes, left, deferred = defaults.decide(recipe, numbers, Recipes({"v": variant}))
+        assert sorted(r["move"] for r, _ in changes) == ["kick.limit", "snare.compress"] and left == deferred == []
+        assert [s["id"] for s in new["steps"]] == ["s-comp", snare_steps[0]["id"]]
+
+
+def test_a_trial_that_would_not_sit_where_measured_waits():
+    recipe = two_sources(step("kick-lim", "Kick.wav", "Limiter"), [step("s-eq", "Snare.wav", "PeakFilter")],
+                         dict(step("s-comp", "Snare.wav", "Compressor"), before="s-eq"))
+    variant = structure.apply_patch(recipe, recipe["moves"][1]["trial"])
+    assert defaults.placed(variant, variant)
+    moved = copy.deepcopy(variant)
+    moved["steps"] = [moved["steps"][0], moved["steps"][2], moved["steps"][1]]
+    assert not defaults.placed(moved, variant)
+    # Steps a drop removed, or another keep added, don't count against it.
+    assert defaults.placed({"steps": [variant["steps"][1], variant["steps"][2], step("x", "Snare.wav", "Gain")]}, variant)
+
+
+def test_a_steady_default_that_only_waits_is_not_sent_for_an_override(tmp_path, monkeypatch, capsys):
+    """tom1's compressor cycles while mix-bus.console's default stays kept and waits on the lower level every round."""
+    recipe = {"stems": {"Tom1.wav": {}}, "buses": {}, "sources": {"tom1": {"chain": "toms", "stems": ["Tom1.wav"]}},
+              "steps": [step("t-comp", "Tom1.wav", "Compressor")],
+              "moves": [{"move": "toms.compress", "source": "tom1", "decision": "kept", "steps": ["t-comp"], "note": "n"},
+                        {"move": "mix-bus.console", "source": "mix-bus", "decision": "dropped", "note": "n"}]}
+    original = copy.deepcopy(recipe)
+    path = tmp_path / "recipe.json"
+    path.write_text(json.dumps(recipe, indent=2) + "\n")
+    monkeypatch.setattr(check, "structural", lambda r, s, m: ({}, [], []))
+    monkeypatch.setattr(check, "renders", lambda r, s, m: [])
+    monkeypatch.setattr(check, "release", lambda variants: None)
+
+    def measured(recipe, song, nodes, master):
+        kept = recipe["moves"][0]["decision"] == "kept"
+        tom = {"move": "toms.compress", "source": "tom1", "decision": recipe["moves"][0]["decision"],
+               "outcome": "dropped" if kept else "kept", "needed": "false" if kept else "true", "worked": None if kept else "true",
+               "with": "trial", "leaves": [leaf("needed", 2.9 if kept else 3.2, "> 3", "false" if kept else "true", "spread")],
+               "fails": ["the default outcome is dropped; drop it, or give an override with a measured reason" if kept
+                         else "the trial worked; keep it, or give an override with a measured reason"]}
+        console = {"move": "mix-bus.console", "source": "mix-bus", "decision": "dropped", "outcome": "kept", "needed": "true",
+                   "worked": "true", "with": "trial",
+                   "leaves": [{"id": "needed", "state": "true", "value": None, "text": "always"},
+                              leaf("worked.0.1", -0.52, "< -0.5", "true", "dip")],
+                   "fails": ["the trial worked; keep it, or give an override with a measured reason"]}
+        return tmp_path / "r.md", {"contracts": [tom, console]}, Fake({"trial": original})
+
+    monkeypatch.setattr(check, "measured", measured)
+    check.apply_defaults(path, recipe, tmp_path, False)
+    out = capsys.readouterr().out
+    assert "deferred: mix-bus.console on mix-bus: waits for a lower level's changes" in out
+    assert "flips: toms.compress on tom1" in out and "flips: mix-bus.console" not in out
+
+
+def test_only_the_sources_on_a_duck_cycle_fall_back_to_readmes_order():
+    """a and b key each other's Ducks and b keys c's; c is listed before b, but it must still come after its key."""
+    recipe = {"stems": {"A.wav": {}, "C.wav": {}, "B.wav": {}}, "buses": {},
+              "sources": {name: {"chain": "guitars", "stems": [f"{name.upper()}.wav"]} for name in ("a", "c", "b")},
+              "steps": [step("a-to-b", "B.wav", "Duck", key="A.wav"), step("b-to-a", "A.wav", "Duck", key="B.wav"),
+                        step("b-to-c", "C.wav", "Duck", key="B.wav")], "moves": []}
+    rank = defaults.Order(recipe).source_rank
+    assert sorted(rank, key=rank.get) == ["a", "b", "c"]
+
+
+def test_a_needed_leaf_near_its_bar_that_alone_flips_a_kept_record_is_fragile():
+    c = {"move": "toms.limit", "source": "tom1", "needed": "true", "worked": "true", "with": "current",
+         "leaves": [leaf("needed", 3.05, "> 3", "true", "level_top"), leaf("worked.0", -4.0, "< -0.5", "true", "level_top"),
+                    leaf("worked.1", 0.0, ">= -0.5", "true", "attack_p50")]}
+    assert [(found["id"], gap) for found, gap in defaults.fragile(c)] == [("needed", 0.05)]
+
+
+def test_a_field_change_touches_the_stem_it_names_even_with_dots_in_its_name():
+    before = chain_recipe()
+    before["moves"][3]["fields"] = ["stems.Snare.wav.offset_samples"]
+    before["moves"][3]["steps"] = []
+    after = copy.deepcopy(before)
+    after["moves"][3].update(decision="dropped", fields=[])
+    assert {"Snare.wav", "OH.wav", "mix"} <= defaults.touched(before, after, [before["moves"][3]])

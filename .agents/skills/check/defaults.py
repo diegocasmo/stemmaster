@@ -142,83 +142,105 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
             leave(record, f"default {computed}")
         elif c["fails"]:
             leave(record, "; ".join(c["fails"]))
-    out = copy.deepcopy(recipe)
     known = set(validate(recipe)) if validate else set()
-    changes, deferred = [], []
-
-    def valid(candidate, records):
-        new = sorted(set(validate(candidate)) - known) if validate else []
-        for record in records:
-            if new:
-                leave(record, f"not applied: with it the recipe fails: {new}")
-        return not new
-
-    def kept(out, record, c):
+    patches = {}
+    for record, c in keep:
         variant = variants.recipes.get(c["with"])
         patch = trial_patch(recipe, variant) if variant is not None else None
         if not patch:
             leave(record, "its trial can't be written as recipe steps, buses, sends and routing")
-            return None
-        taken = {step.get("id") for step in out.get("steps", [])}
-        names = set(out["stems"]) | set(out.get("buses", {}))
-        clash = sorted(({s["id"] for s in patch.get("steps", [])} & taken) | (set(patch.get("buses", {})) & names))
-        if clash:
-            leave(record, f"its trial reuses names another kept trial added: {clash}")
-            return None
-        candidate = apply_patch(out, patch)
-        steps, fields = claims_of(recipe, patch)
-        entry = candidate["moves"][index[(record["move"], record["source"])]]
-        entry.pop("trial", None)
-        entry["decision"] = "kept"
-        entry["steps"] = steps
-        if fields or "fields" in entry:
-            entry["fields"] = fields
-        if off_tool(entry, patch) and not entry.get("tool_reason"):
-            entry["tool_reason"] = TOOL_REASON
-        if not valid(candidate, [record]):
-            return None
-        return candidate, [(record, f"kept: its trial worked; added steps {steps}" + (f" and {fields}" if fields else "")
-                            + "; its note is as written")]
+        else:
+            patches[id(record)] = (record, patch, variant)
 
-    def dropped(out, group):
-        candidate = out
-        for record, _ in group:
-            candidate = drop_claims(candidate, record)
-            entry = candidate["moves"][index[(record["move"], record["source"])]]
-            entry["decision"] = "dropped"
-            for key in ("steps", "fields"):
-                if key in entry:
-                    entry[key] = []
-        if not valid(candidate, [record for record, _ in group]):
-            return None
-        return candidate, [(record, f"dropped: {why}" + (f"; removed {[*record.get('steps', []), *record.get('fields', [])]}"
-                                                         if record.get("steps") or record.get("fields") else "")
-                            + "; its note is as written") for record, why in group]
+    def assemble(units):
+        """The recipe with these units applied: keeps first, each where its trial was measured, then drops, each group
+        as one off variant (pruning a return between its records would strand the next one's claims). None, with why,
+        when a keep can't be written as measured."""
+        out = copy.deepcopy(recipe)
+        for kind, records in units:
+            if kind != "keep":
+                continue
+            record, patch, _ = patches[id(records[0])]
+            taken = {step.get("id") for step in out.get("steps", [])}
+            names = set(out["stems"]) | set(out.get("buses", {}))
+            clash = sorted(({s["id"] for s in patch.get("steps", [])} & taken) | (set(patch.get("buses", {})) & names))
+            if clash:
+                return None, ("left", f"its trial reuses names another kept trial added: {clash}")
+            out = apply_patch(out, patch)
+            steps, fields = claims_of(recipe, patch)
+            entry = out["moves"][index[(record["move"], record["source"])]]
+            entry.pop("trial", None)
+            entry["decision"] = "kept"
+            entry["steps"] = steps
+            if fields or "fields" in entry:
+                entry["fields"] = fields
+            if off_tool(entry, patch) and not entry.get("tool_reason"):
+                entry["tool_reason"] = TOOL_REASON
+        for kind, records in units:
+            if kind != "drop":
+                continue
+            out = drop_claims(out, records)
+            for record in records:
+                entry = out["moves"][index[(record["move"], record["source"])]]
+                entry["decision"] = "dropped"
+                for key in ("steps", "fields"):
+                    if key in entry:
+                        entry[key] = []
+        for kind, records in units:
+            if kind == "keep" and not placed(out, patches[id(records[0])][2]):
+                return None, ("deferred", "its trial would not sit where it was measured next to this round's other changes")
+        return out, None
 
-    units = [([record], lambda out, record=record, c=c: kept(out, record, c)) for record, c in keep]
-    units += [([record for record, _ in group], lambda out, group=group: dropped(out, group))
-              for group in drop_groups(drop, out, leave)]
+    reasons = {id(record): why for record, why in drop}
+    units = [("keep", [patches[id(record)][0]]) for record, _ in keep if id(record) in patches]
+    units += [("drop", [record for record, _ in group]) for group in drop_groups(drop, copy.deepcopy(recipe), leave)]
     rank = Order(recipe)
-    units.sort(key=lambda unit: min(rank.of(record) for record in unit[0]))
-    level, busy = None, set()
-    for records, apply in units:
+    units.sort(key=lambda unit: min(rank.of(record) for record in unit[1]))
+    chosen, deferred, level, busy = [], [], None, set()
+    out = copy.deepcopy(recipe)
+    for unit in units:
+        records = unit[1]
         sources = {record["source"] for record in records}
         unit_level = min(rank.level(record) for record in records)
         if (level is not None and unit_level > level) or sources & busy or rank.upstream(sources) & busy:
             deferred += [(record, "waits for " + ("a lower level's changes" if level is not None and unit_level > level
                                                    else "a change before it in signal order")) for record in records]
             continue
-        done = apply(out)
-        if done is None:
+        candidate, refused = assemble(chosen + [unit])
+        if candidate is not None and validate and (new := sorted(set(validate(candidate)) - known)):
+            refused = ("left", f"not applied: with it the recipe fails: {new}")
+        if refused:
+            kind, why = refused
+            (left if kind == "left" else deferred).extend((record, why) for record in records)
             continue
-        out, applied = done
-        changes += applied
+        chosen.append(unit)
+        out = candidate
         level = unit_level
         busy |= sources
+    changes = []
+    for kind, records in chosen:
+        for record in records:
+            if kind == "keep":
+                entry = out["moves"][index[(record["move"], record["source"])]]
+                changes.append((record, f"kept: its trial worked; added steps {entry['steps']}"
+                                + (f" and {entry['fields']}" if entry.get("fields") else "") + "; its note is as written"))
+            else:
+                what = [*record.get("steps", []), *record.get("fields", [])]
+                changes.append((record, f"dropped: {reasons[id(record)]}" + (f"; removed {what}" if what else "")
+                                + "; its note is as written"))
     order = {id(r): i for i, r in enumerate(moves)}
     return (out, sorted(changes, key=lambda c: order[id(c[0])]), sorted(left, key=lambda c: order[id(c[0])]),
             sorted(deferred, key=lambda c: order[id(c[0])]))
 
+
+def placed(recipe, variant):
+    """Whether every step the trial variant has sits in the recipe in the variant's order on its target, against the
+    steps both share: a removed anchor makes apply_patch append, which can move a trial past another processor."""
+    ids = {step.get("id") for step in recipe.get("steps", [])}
+    shared = ids & {step.get("id") for step in variant.get("steps", [])}
+    targets = {step["target"] for step in variant.get("steps", []) if step.get("id") in shared}
+    on = lambda r, target: [s["id"] for s in r.get("steps", []) if s["target"] == target and s.get("id") in shared]
+    return all(on(recipe, target) == on(variant, target) for target in targets)
 
 class Order:
     """Signal order for applying defaults: level, then sources by Duck keys (README's order breaking ties and cycles),
@@ -247,17 +269,19 @@ class Order:
             chain = sources[source].get("chain")
             return (SOURCE_ORDER.index(chain) if chain in SOURCE_ORDER else len(SOURCE_ORDER), listed.index(source))
 
-        incoming = {source: {s for s, targets in self.edges.items() if source in targets} for source in sources}
-        ordered, ready = [], sorted((s for s in sources if not incoming[s]), key=tie)
-        while ready:
-            source = ready.pop(0)
-            ordered.append(source)
-            for target in sorted(self.edges.get(source, ()), key=tie):
-                incoming[target].discard(source)
-                if not incoming[target] and target not in ordered and target not in ready:
-                    ready = sorted(ready + [target], key=tie)
-        # Sources on a Duck cycle keep README's order.
-        ordered += sorted((s for s in sources if s not in ordered), key=tie)
+        # Strongly connected parts of the Duck graph: a cycle's sources keep README's order among themselves only, and
+        # the parts, a lone source being one, go in dependency order.
+        reach = {source: self.reachable(source) for source in sources}
+        part = {source: frozenset(s for s in sources if s == source or (s in reach[source] and source in reach[s]))
+                for source in sources}
+        parts = sorted(set(part.values()), key=lambda p: min(map(tie, p)))
+        before = {p: {part[key] for key in sources for target in self.edges.get(key, ()) if part[target] == p and part[key] != p}
+                  for p in parts}
+        ordered, done = [], set()
+        while len(done) < len(parts):
+            p = next(p for p in parts if p not in done and before[p] <= done)
+            done.add(p)
+            ordered += sorted(p, key=tie)
         self.source_rank = {source: i for i, source in enumerate(ordered)}
 
     def level(self, record):
@@ -268,6 +292,15 @@ class Order:
     def of(self, record):
         return (self.level(record), self.source_rank.get(record["source"], len(self.source_rank)),
                 self.chain_rank.get(record["move"], 0))
+
+    def reachable(self, source):
+        found, todo = set(), [source]
+        while todo:
+            for target in self.edges.get(todo.pop(), ()):
+                if target not in found:
+                    found.add(target)
+                    todo.append(target)
+        return found
 
     def upstream(self, sources):
         """Every source whose output a Duck in these sources is keyed on, directly or through other Ducks."""
@@ -324,15 +357,16 @@ def fed(recipe):
     return {settings.get("bus", "mix") for settings in entries} | {send["bus"] for settings in entries for send in settings.get("sends", [])}
 
 
-def drop_claims(recipe, record):
-    """The record's off variant, as the check measured it, without the empty sends lists and unfed returns that leaves.
+def drop_claims(recipe, records):
+    """The records' off variant, as the check measured it, without the empty sends lists and unfed returns that leaves.
 
     A return the drop leaves unfed renders silence, and the renderer refuses an unfed bus in a song's own recipe, so it
     goes when no step acts on it.
     """
     before = fed(recipe)
-    out = evidence.off_variant(recipe, record)
-    for field in record.get("fields", []):
+    union = {key: list(dict.fromkeys(c for record in records for c in record.get(key, []))) for key in ("steps", "fields")}
+    out = evidence.off_variant(recipe, union)
+    for field in union["fields"]:
         kind, rest = field.split(".", 1)
         if ".sends." in rest:
             name = rest.split(".sends.")[0]
@@ -354,8 +388,12 @@ def override_report(record, c):
     return f"its override is as written, citing {cited}; {'; '.join(c['fails'])}; values: {', '.join(values)}"
 
 
+def default_of(c, needed, worked):
+    return evidence.outcome(None, needed, worked, c.get("with") is not None)
+
+
 def deciding_part(c):
-    return "worked" if c.get("worked") is not None and c["needed"] == outcome_tools.TRUE else "needed"
+    return default_of(c, c["needed"], c.get("worked"))[1]
 
 
 def deciding(c):
@@ -376,18 +414,23 @@ def clearance(leaf):
 
 
 def fragile(c):
-    """The deciding leaves within FRAGILE of their bar whose flip alone would flip the part they decide."""
-    part = deciding_part(c)
-    tree = contracts.CONTRACTS[c["move"]][part]
+    """The leaves within FRAGILE of their bar whose flip alone would flip the record's default, in Needed if or Worked
+    if."""
+    contract = contracts.CONTRACTS[c["move"]]
     states = {leaf["id"]: leaf["state"] for leaf in c["leaves"]}
-    now = outcome_tools.restate(tree, states, part)
+
+    def default(states):
+        worked = outcome_tools.restate(contract["worked"], states, "worked") if c.get("worked") is not None else None
+        return default_of(c, outcome_tools.restate(contract["needed"], states, "needed"), worked)[0]
+
+    now = default(states)
     found = []
-    for leaf in deciding(c):
+    for leaf in c["leaves"]:
         gap = clearance(leaf)
         if gap is None or abs(gap) >= FRAGILE or leaf["state"] not in (outcome_tools.TRUE, outcome_tools.FALSE):
             continue
         flipped = outcome_tools.FALSE if leaf["state"] == outcome_tools.TRUE else outcome_tools.TRUE
-        if outcome_tools.restate(tree, states | {leaf["id"]: flipped}, part) != now:
+        if default(states | {leaf["id"]: flipped}) != now:
             found.append((leaf, gap))
     return found
 
@@ -452,7 +495,10 @@ def touched(before, after, changed):
         for recipe, claimed in ((before, record), (after, new)):
             steps = {step["id"]: step for step in recipe.get("steps", [])}
             names |= {steps[i]["target"] for i in claimed.get("steps", []) if i in steps}
-            names |= {field.split(".")[1] for field in claimed.get("fields", [])}
+            known = list(recipe["stems"]) + list(recipe.get("buses", {}))
+            # Stem names hold dots ("Snare.wav"), so a field names the stem or bus it starts with.
+            names |= {name for field in claimed.get("fields", []) for name in known
+                      if field.split(".", 1)[1].startswith(f"{name}.")}
     if names - {n for n in names if n.startswith("move:")}:
         names.add("mix")
     for recipe in (before, after):

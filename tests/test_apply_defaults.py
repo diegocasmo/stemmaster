@@ -464,3 +464,32 @@ def test_a_round_lets_its_renders_go_before_the_next_starts(song, monkeypatch):
     check.apply_defaults(path, recipe, song, False)
     gc.collect()
     assert len(rounds) == 3 and all(r and all(r) for r in rounds[1:]) and all(ref() is None for ref in held)
+
+
+def test_a_shared_drop_group_removes_all_its_claims_before_pruning_returns(song):
+    """Both toms claim one reverb on S, fed through a chain of returns toms -> R -> S: dropping them together removes
+    the chain, where dropping the first alone would prune R before the second's claim on it."""
+    for i, stem in enumerate(("Tom1.wav", "Tom2.wav")):
+        soundfile.write(song / "stems" / stem, np.random.default_rng(i).normal(0, 0.01, (RATE, 2)), RATE, subtype="FLOAT")
+    recipe = {
+        "stems": {"Tom1.wav": {"bus": "toms"}, "Tom2.wav": {"bus": "toms"}},
+        "sources": {"tom1": {"chain": "toms", "stems": ["Tom1.wav"]}, "tom2": {"chain": "toms", "stems": ["Tom2.wav"]}},
+        "buses": {"toms": {"bus": "drums", "sends": [{"bus": "R", "gain_db": -10}]}, "drums": {},
+                  "R": {"bus": "drums", "sends": [{"bus": "S", "gain_db": -10}]}, "S": {"bus": "drums"}},
+        "steps": [step("rv", "S", "Reverb", dry_level=0, wet_level=0.3)],
+        "moves": [],
+    }
+    docs = chains.parse()[0]
+    for source, chain in structure.instances(recipe):
+        if chain != "master":
+            recipe["moves"] += [{"move": move, "source": source, "decision": "dropped", "note": "n"}
+                                for move in structure.moves_for(recipe, source, chain, docs)]
+    for record in recipe["moves"]:
+        if record["move"] == "toms.reverb":
+            record.update(decision="kept", steps=["rv"], fields=["buses.toms.sends.R", "buses.R.sends.S"], tool_reason="built-in stand-in")
+    assert check.renders(recipe, song, False) == []
+    numbers = {"contracts": [contract("toms.reverb", source, "kept", "dropped", needed="false") for source in ("tom1", "tom2")]}
+    new, changes, left, _ = defaults.decide(recipe, numbers, Recipes({}), validate=lambda r: check.renders(r, song, False))
+    assert len(changes) == 2 and left == []
+    assert new["buses"] == {"toms": {"bus": "drums"}, "drums": {}} and new["steps"] == []
+    assert check.renders(new, song, False) == []
