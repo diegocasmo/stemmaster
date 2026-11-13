@@ -87,15 +87,17 @@ def main():
         sys.exit(1)
     if asking:
         now = review.snapshot(recipe, inputs(song, recipe), code_files(), path, numbers, notes)
-        base = review.passing_base(reviewed, now, path.parent)
+        base, state = review.latest_base(reviewed, now, path.parent)
         now["base"] = base and base["fingerprint"]
-        text, asked = review.prompt_for(now, base)
+        text, asked = review.prompt_for(now, base, state)
+        review.write_pack(numbers, now["fingerprint"], path)
         prompt, digest = review.write_prompt(text, path.parent)
         review.save_snapshot(path.parent, now)
         entry = {"stage": "mix", "fingerprint": now["fingerprint"], "trial_master": review.trial_master(recipe)}
         if base:
             entry["base"] = base["fingerprint"]
-            print(f"scoped on the passing review of {base['fingerprint']}: {len(asked)} of {len(review.questions(numbers))} questions")
+            print(f"scoped on the review of {base['fingerprint']} ({'passed' if state['passed'] else 'failed'}): "
+                  f"{len(asked)} ids to answer of {len(review.questions(numbers))} questions")
         entry["by"] = [{"agent": agent, "session": "<its session uuid>"} for agent in review.AGENTS]
         print(f"review prompt: {prompt} (sha256 {digest})")
         print("send it, unchanged, as the first message of one fresh Claude and one fresh Codex session, then add to reviews:")
