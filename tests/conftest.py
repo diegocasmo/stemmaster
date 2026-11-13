@@ -19,3 +19,12 @@ def song(tmp_path):
 def one_process(monkeypatch):
     """Tests count renders in this process, so the check runs here unless a test asks for workers."""
     monkeypatch.setenv("STEMMASTER_CHECK_WORKERS", "1")
+
+
+@pytest.fixture(autouse=True)
+def measurement_disk(tmp_path_factory, monkeypatch):
+    """Each test keeps its readings in a folder of its own, never in the user's cache."""
+    import memo
+
+    monkeypatch.setenv("STEMMASTER_MEASURE_MEMO_DIR", str(tmp_path_factory.mktemp("measurements")))
+    monkeypatch.setattr(memo.CACHE, "_disk", memo._FROM_ENV)

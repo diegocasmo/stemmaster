@@ -3,6 +3,7 @@ import functools
 import hashlib
 import json
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -324,6 +325,39 @@ def plan(recipe, song, nodes):
     for name, node in nodes.items():
         chain_nodes.setdefault(sources[name].get("chain"), []).append(node)
     return points, chain_times, chain_nodes, timing_stems, {name: len(found) for name, found in times.items()}, times
+
+
+def plan_key(recipe, nodes, outside):
+    """Everything plan() reads: the stems' samples and the code (in `outside`), and the recipe's routing, offsets,
+    sources and step targets. No level, pan or setting decides where a hit is."""
+    def routing(entries, extra=()):
+        return {name: {"bus": entry.get("bus", "mix"), "sends": [send.get("bus") for send in entry.get("sends", [])]}
+                | {key: entry[key] for key in extra if key in entry} for name, entry in entries.items()}
+    sources = {name: untext(source) for name, source in recipe.get("sources", {}).items()}
+    return fingerprint("plan", outside[:2], sources, routing(recipe["stems"], ("offset_samples",)),
+                       routing(recipe.get("buses", {})), [step["target"] for step in recipe.get("steps", [])],
+                       recipe.get("tail_seconds", 0), nodes)
+
+
+def cached_plan(recipe, song, nodes, outside):
+    """plan(), kept on disk by everything it reads, so a re-check with the same stems and routing skips hit detection."""
+    path = song / "renders" / "check" / f"plan-{plan_key(recipe, nodes, outside)}.pkl"
+    try:
+        data = path.read_bytes()
+        if hashlib.sha256(data[32:]).digest() == data[:32]:
+            return pickle.loads(data[32:])
+    except Exception:
+        pass
+    planned = plan(recipe, song, nodes)
+    payload = pickle.dumps(planned, protocol=5)
+    try:
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temp.write_bytes(hashlib.sha256(payload).digest() + payload)
+        os.replace(temp, path)
+    except OSError:
+        pass
+    # The same round trip a hit makes, so a cold check and a re-check build on equal objects.
+    return pickle.loads(payload)
 
 
 MAX_VIEWS = 3
@@ -1010,8 +1044,8 @@ def measured(recipe, song, nodes, master_mode=False):
     """The report, and the variants it judged each record on (a kept default reads its trial from them)."""
     cache = song / "renders" / "check"
     cache.mkdir(parents=True, exist_ok=True)
-    planned = plan(recipe, song, nodes)
     outside = inputs(song, recipe)
+    planned = cached_plan(recipe, song, nodes, outside)
     variants, ctx, records = prepare(recipe, song, nodes, planned, outside)
     progress(f"report on {sum(r.get('move') != 'balance' for r in recipe.get('moves', []))} moves")
     promote(recipe, variants, ctx, master_mode)
