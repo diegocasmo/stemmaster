@@ -6,6 +6,7 @@ import chains
 import contracts
 import evidence
 import outcomes as outcome_tools
+import structure
 from structure import Routing, apply_patch, identity
 
 KEPT = ("kept", "changed")
@@ -196,13 +197,15 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
     units += [("drop", [record for record, _ in group]) for group in drop_groups(drop, copy.deepcopy(recipe), leave)]
     rank = Order(recipe)
     units.sort(key=lambda unit: min(rank.of(record) for record in unit[1]))
-    chosen, deferred, level, busy = [], [], None, set()
+    chosen, deferred, level, busy, busy_nodes = [], [], None, set(), set()
     out = copy.deepcopy(recipe)
     for unit in units:
         records = unit[1]
         sources = {record["source"] for record in records}
         unit_level = min(rank.level(record) for record in records)
-        if (level is not None and unit_level > level) or sources & busy or rank.upstream(sources) & busy:
+        acted = nodes_of(recipe, unit[0], records, patches)
+        if (level is not None and unit_level > level) or sources & busy or rank.upstream(sources) & busy \
+                or acted & busy_nodes:
             deferred += [(record, "waits for " + ("a lower level's changes" if level is not None and unit_level > level
                                                    else "a change before it in signal order")) for record in records]
             continue
@@ -217,6 +220,7 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
         out = candidate
         level = unit_level
         busy |= sources
+        busy_nodes |= acted
     changes = []
     for kind, records in chosen:
         for record in records:
@@ -231,6 +235,31 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
     order = {id(r): i for i, r in enumerate(moves)}
     return (out, sorted(changes, key=lambda c: order[id(c[0])]), sorted(left, key=lambda c: order[id(c[0])]),
             sorted(deferred, key=lambda c: order[id(c[0])]))
+
+
+def field_names(recipe, fields):
+    """The stems and buses fields name: stem names hold dots ("Snare.wav"), so a field names the one it starts with."""
+    known = list(recipe["stems"]) + list(recipe.get("buses", {}))
+    return {name for field in fields for name in known if field.split(".", 1)[1].startswith(f"{name}.")}
+
+
+def nodes_of(recipe, kind, records, patches):
+    """The stems and buses a change acts on, where its records' readings go through: its steps' targets (a shared bus
+    like the tom bus among them), the stems and buses its fields name, and each record's own node."""
+    steps = {step["id"]: step for step in recipe.get("steps", [])}
+    routing = Routing(recipe)
+    found = set()
+    for record in records:
+        if kind == "keep":
+            patch = patches[id(record)][1]
+            found |= {step["target"] for step in patch.get("steps", [])}
+            found |= field_names(recipe, claims_of(recipe, patch)[1]) | set(patch.get("buses", {}))
+        found |= {steps[i]["target"] for i in record.get("steps", []) if i in steps}
+        found |= field_names(recipe, record.get("fields", []))
+        stems = [stem for stem in recipe.get("sources", {}).get(record["source"], {}).get("stems", []) if stem in recipe["stems"]]
+        if stems:
+            found.add(structure.node_of(routing, stems))
+    return found - {None, "mix"}
 
 
 def placed(recipe, variant):
@@ -495,10 +524,7 @@ def touched(before, after, changed):
         for recipe, claimed in ((before, record), (after, new)):
             steps = {step["id"]: step for step in recipe.get("steps", [])}
             names |= {steps[i]["target"] for i in claimed.get("steps", []) if i in steps}
-            known = list(recipe["stems"]) + list(recipe.get("buses", {}))
-            # Stem names hold dots ("Snare.wav"), so a field names the stem or bus it starts with.
-            names |= {name for field in claimed.get("fields", []) for name in known
-                      if field.split(".", 1)[1].startswith(f"{name}.")}
+            names |= field_names(recipe, claimed.get("fields", []))
     if names - {n for n in names if n.startswith("move:")}:
         names.add("mix")
     for recipe in (before, after):

@@ -195,3 +195,26 @@ def test_a_field_change_touches_the_stem_it_names_even_with_dots_in_its_name():
     after = copy.deepcopy(before)
     after["moves"][3].update(decision="dropped", fields=[])
     assert {"Snare.wav", "OH.wav", "mix"} <= defaults.touched(before, after, [before["moves"][3]])
+
+
+def tom_bus(tom2_target):
+    """Two toms routed to one tom bus: tom1's compressor trial goes on the bus, tom2 drops an EQ on `tom2_target`."""
+    recipe = {"stems": {"Tom1.wav": {"bus": "toms"}, "Tom2.wav": {"bus": "toms"}}, "buses": {"toms": {}},
+              "sources": {"tom1": {"chain": "toms", "stems": ["Tom1.wav"]}, "tom2": {"chain": "toms", "stems": ["Tom2.wav"]}},
+              "steps": [step("t2-eq", tom2_target, "PeakFilter")],
+              "moves": [{"move": "toms.compress", "source": "tom1", "decision": "dropped", "note": "n",
+                         "trial": {"steps": [step("toms-comp", "toms", "Compressor")]}},
+                        {"move": "toms.eq", "source": "tom2", "decision": "kept", "steps": ["t2-eq"], "note": "n"}]}
+    variant = structure.apply_patch(recipe, recipe["moves"][0]["trial"])
+    numbers = {"contracts": [contract("toms.compress", "tom1", "dropped", "kept", with_key="v"),
+                             contract("toms.eq", "tom2", "kept", "dropped", needed="false")]}
+    return defaults.decide(recipe, numbers, Recipes({"v": variant}))
+
+
+def test_a_shared_bus_takes_one_change_per_round():
+    _, changes, _, deferred = tom_bus("toms")
+    assert [r["source"] for r, _ in changes] == ["tom1"]
+    assert [(r["source"], why) for r, why in deferred] == [("tom2", "waits for a change before it in signal order")]
+    # On its own stem, tom2's change shares no node with tom1's and goes in the same round.
+    _, changes, _, deferred = tom_bus("Tom2.wav")
+    assert sorted(r["source"] for r, _ in changes) == ["tom1", "tom2"] and deferred == []
