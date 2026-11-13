@@ -5,6 +5,7 @@ import pyloudnorm
 import pytest
 from scipy import signal
 
+import evidence
 import outcomes
 from helpers import RATE, noise, view, write
 
@@ -108,15 +109,38 @@ def test_shared_bus_dynamics_are_measured(song):
     assert lr(clipped_pair(song), song) == pytest.approx(CLIPPED_DB, abs=0.01)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason="#5: a rhythm send to a reverb the lead shares leaves the pair unresolved")
 @pytest.mark.parametrize("measure, expected", [("lr_loudness", LOPSIDED_DB), ("lr_band_diff", 0)])
 def test_rhythm_send_to_shared_reverb_reads_the_dry_pair(song, measure, expected):
-    recipe = lopsided(guitars(song))
+    recipe = shared_verb(lopsided(guitars(song)))
+
+    assert lr(recipe, song, measure) == pytest.approx(expected, abs=0.01)
+
+
+def shared_verb(recipe):
     recipe["buses"]["verb"] = {}
     for name in ("GtrL.wav", "GtrR.wav", "GtrLead.wav"):
         recipe["stems"][name]["sends"] = [{"bus": "verb", "gain_db": -18}]
+    return recipe
 
-    assert lr(recipe, song, measure) == pytest.approx(expected, abs=0.01)
+
+def test_the_check_taps_the_dry_rhythms_it_reads_the_pair_on(song):
+    recipe = shared_verb(guitars(song))
+    record = {"move": "guitars.pair", "source": "guitars", "decision": "changed", "steps": []}
+
+    taps = evidence.contract_taps(view(recipe, song).ctx, [record])
+
+    assert {"GtrL.wav", "GtrR.wav"} <= taps
+
+
+def test_a_duck_the_rhythm_sends_key_makes_the_dry_pair_a_question(song):
+    recipe = shared_verb(guitars(song))
+    # The left rhythm can't key from a return it feeds, so only the right one sends.
+    del recipe["stems"]["GtrL.wav"]["sends"]
+    recipe["steps"] = [{"id": "duck", "target": "GtrL.wav", "plugin": "Duck",
+                        "settings": {"key": "verb", "threshold_db": -35, "ratio": 20, "range_db": 12,
+                                     "attack_ms": 0, "release_ms": 100}}]
+
+    assert isinstance(lr(recipe, song), outcomes.Review)
 
 
 def test_lead_gap_with_a_lead_only_delay(song):

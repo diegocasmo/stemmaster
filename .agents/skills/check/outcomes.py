@@ -1063,18 +1063,42 @@ def lr_reading(view, source, args, value):
     return value
 
 
+def dry_rhythms(view, source, args):
+    """The rhythms' left and right come from their own pan and level, so where a send into a return other parts share
+    keeps them from being read alone, they are read on a render without their sends. Returns that view, and the Duck
+    keys those sends feed: without them a Duck can act differently on the dry rhythms."""
+    recipe = view.recipe or view.ctx.recipe
+    if args.get("point") != "rhythm" or view.twin is None or rhythm_path(view.ctx, source, "rhythm", recipe) is not None:
+        return view, []
+    dry = without_sends(recipe, role_stems(view.ctx, source, "rhythm"))
+    if dry is recipe:
+        return view, []
+    wet, bare = Routing(recipe), Routing(dry)
+    keys = sorted({step["settings"]["key"] for step in recipe.get("steps", []) if step.get("plugin") == "Duck"
+                   and wet.stems_into(step["settings"]["key"]) != bare.stems_into(step["settings"]["key"])})
+    return view.twin(dry), keys
+
+
+def dry_reading(keys, value):
+    if value is None or not keys or isinstance(value, Review):
+        return value
+    return Review(value, f"the rhythms were read without their sends, which also key the Duck on {keys}: judge the pair in the mix")
+
+
 def m_lr_loudness(view, source, args):
+    view, keys = dry_rhythms(view, source, args)
     audio = view.audio(args.get("point", "node"), source)
     if audio is None or audio.shape[1] != 2:
         return None
     meter = pyloudnorm.Meter(view.rate)
     left, right = (meter.integrated_loudness(np.repeat(audio[:, [c]], 2, axis=1)) for c in (0, 1))
-    return lr_reading(view, source, args, abs(left - right))
+    return dry_reading(keys, lr_reading(view, source, args, abs(left - right)))
 
 
 def m_lr_band_diff(view, source, args):
+    view, keys = dry_rhythms(view, source, args)
     found = lr_tone_diff(view, args.get("point", "node"), source)
-    return None if found is None else lr_reading(view, source, args, found)
+    return None if found is None else dry_reading(keys, lr_reading(view, source, args, found))
 
 
 def lr_tone_diff(view, point, source):
