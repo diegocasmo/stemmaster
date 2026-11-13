@@ -2,6 +2,7 @@ import copy
 import functools
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -275,6 +276,23 @@ def progress(message):
     print(f"check: {message}, {time.monotonic() - STARTED:.0f} s", file=sys.stderr, flush=True)
 
 
+def node_memo():
+    megabytes = os.environ.get("STEMMASTER_NODE_MEMO_MB", str(render.MEMO_BYTES >> 20))
+    try:
+        megabytes = int(megabytes)
+    except ValueError:
+        sys.exit(f"STEMMASTER_NODE_MEMO_MB must be a whole number of MB (0 turns the memo off), not {megabytes!r}")
+    if megabytes <= 0:
+        return None
+    folder = os.environ.get("STEMMASTER_NODE_MEMO_DIR")
+    try:
+        folder = folder or render.memo_folder()
+        return render.Memo(folder, megabytes << 20)
+    except Exception as error:
+        print(f"warning: node memo off, can't use {folder}: {error}", file=sys.stderr)
+        return None
+
+
 class Variants:
 
     def __init__(self, recipe, song, cache, layout, boundary, outside, ctx, taps):
@@ -283,6 +301,7 @@ class Variants:
         self.views, self.batteries, self.probes = {}, {}, {}
         self.recipes = {"current": recipe}
         self.target = ctx.target
+        self.memo = node_memo()
 
     def add(self, key, variant, probes=None):
         self.recipes.setdefault(key, variant)
@@ -316,7 +335,8 @@ class Variants:
                  "Delay": functools.partial(outcome_tools.engagement, align=False)}
         probes = {step_id: probe.get(plugins.get(step_id), outcome_tools.engagement) for step_id in self.probes.get(key, {})}
         taps = sorted(({tap for tap, _ in self.layout[0].values()} | self.taps) & set(render.sources(variant)))
-        result = render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary, probes=probes)
+        result = render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary, probes=probes,
+                               memo=self.memo)
         numbers, master = battery(self.recipe, result, *self.layout, self.target)
         self.battery_path(key).write_text(json.dumps(numbers))
         self.batteries[key] = numbers
