@@ -700,7 +700,7 @@ def test_no_home_folder_turns_the_memo_off(monkeypatch, capsys):
 def test_a_stale_pyc_turns_the_memo_off(tmp_path):
     code = tmp_path / "code"
     code.mkdir()
-    for name in ("render.py", "native.py", "airwindows.py"):
+    for name in ("render.py", "native.py", "airwindows.py", "prepared.py"):
         shutil.copyfile(Path(render.__file__).with_name(name), code / name)
     native = code / "native.py"
     stat = native.stat()

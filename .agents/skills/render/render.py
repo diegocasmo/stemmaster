@@ -22,6 +22,7 @@ import soundfile
 
 import airwindows
 import native
+import prepared
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".agents" / "skills" / "analyze"))
@@ -45,16 +46,23 @@ LIBC = ctypes.CDLL(None)
 RAND_SEED = 1
 
 
-def load(step):
+def _load_plugin(bundle, **kwargs):
+    # Dragonfly and Airwindows draw on the process-wide C rand(), so without a fixed seed their output depends on
+    # how many plugins loaded before them in this process.
+    LIBC.srand(RAND_SEED)
+    return pedalboard.load_plugin(str(bundle), **kwargs)
+
+
+def load(step, rate=None, channels=None):
     name, settings = step["plugin"], dict(step["settings"])
     bundle = PLUGINS / f"{name}.vst3"
     if not bundle.exists():
         return getattr(pedalboard, name)(**settings)
+    prepared_key = prepared.key(bundle, settings, rate, channels)
+    if (plugin := prepared.load(bundle, prepared_key, _load_plugin)) is not None:
+        return plugin
     # A fresh instance per step: reset() does not clear every plugin's state, so reuse changes the sound.
-    # Dragonfly and Airwindows draw on the process-wide C rand(), so without a fixed seed their output depends on
-    # how many plugins loaded before them in this process.
-    LIBC.srand(RAND_SEED)
-    plugin = pedalboard.load_plugin(str(bundle))
+    plugin = _load_plugin(bundle)
     if "effect" in settings:
         airwindows.select(plugin, settings.pop("effect"))
         # Switching effects keeps the previous effect's slot values, so an unset parameter is a leftover, not a default.
@@ -65,13 +73,14 @@ def load(step):
         if key not in plugin.parameters:
             sys.exit(f"step {step.get('id')}: {name} has no parameter {key}")
         setattr(plugin, key, value)
+    prepared.remember(plugin, prepared_key)
     return plugin
 
 
 def apply(audio, rate, step, context):
     if step["plugin"] in NATIVE:
         return NATIVE[step["plugin"]](audio, rate, step["settings"], context)
-    plugin = load(step)
+    plugin = load(step, rate=rate, channels=max(2, audio.shape[1]))
     # Some VST3s accept only stereo, so a mono stem goes through them as two equal channels.
     mono = audio.shape[1] == 1 and isinstance(plugin, pedalboard.VST3Plugin)
     stereo = np.repeat(audio, 2, axis=1) if mono else audio
@@ -124,8 +133,8 @@ def runs_source(module):
 
 # Hashed at import, so the tag names the code this process runs even if the files change on disk later. None when a
 # stale .pyc may be what runs, which turns the memo off.
-CODE = code_digest(Path(__file__).with_name(name) for name in ("render.py", "native.py", "airwindows.py")) \
-    if all(runs_source(module) for module in (sys.modules[__name__], native, airwindows)) else None
+CODE = code_digest(Path(__file__).with_name(name) for name in ("render.py", "native.py", "airwindows.py", "prepared.py")) \
+    if all(runs_source(module) for module in (sys.modules[__name__], native, airwindows, prepared)) else None
 # Only names the memo writes are ever evicted, so a folder shared with other files keeps them.
 MEMO_NAME = re.compile(r"([0-9a-f]{16})-[0-9a-f]{64}(\.npy|\.seen|\.\d+\.tmp)")
 # What an empty file takes on disk, so seen markers count toward the cap.
@@ -170,7 +179,7 @@ class Memo:
 
     def __init__(self, folder, cap_bytes=MEMO_BYTES, sightings=2):
         if CODE is None:
-            raise RuntimeError("a .pyc of render.py, native.py or airwindows.py holds other code than its source")
+            raise RuntimeError("a .pyc of render.py, native.py, airwindows.py or prepared.py holds other code than its source")
         # Most outputs are computed once and never asked for again, so with sightings=2 one is stored only on its
         # second computation; an empty .seen file remembers the first, across runs too. sightings=1 stores on the first.
         if sightings not in (1, 2):
