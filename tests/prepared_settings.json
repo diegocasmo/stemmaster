@@ -1,0 +1,85 @@
+{
+  "TDR Kotelnikov": {
+    "threshold_db": -24.705,
+    "ratio": 5.421,
+    "attack_ms": 6.001,
+    "release_peak_ms": 242.838,
+    "release_rms_ms": 621.883,
+    "out_gain_db": -0.667,
+    "quality": "Eco"
+  },
+  "ZL Equalizer 2": {
+    "filter_status0_filter_status": "On",
+    "filter_type0_filter_type": "Peak",
+    "order0_order": "12 dB/oct",
+    "freq0_freq": 6906.818,
+    "gain0_gain": -2.931,
+    "q0_q": 2.62,
+    "lrmode0_lrmode": "Stereo"
+  },
+  "ZL Limiter": {
+    "input_gain_input_gain": 10.976,
+    "attack_attack": 20.595,
+    "release_release": 606.775,
+    "true_peak_true_peak": true
+  },
+  "ZaMultiCompX2": {
+    "threshold_1_db": -12.098,
+    "ratio1": 7.041,
+    "attack1_ms": 26.381,
+    "release1_ms": 68.46,
+    "zamcomp_1_on": 1.0,
+    "makeup_1_db": 1.734,
+    "threshold_2_db": -17.865,
+    "ratio2": 6.186,
+    "attack2_ms": 20.472,
+    "release2_ms": 76.482,
+    "zamcomp_2_on": 1.0,
+    "makeup_2_db": 2.942,
+    "threshold_3_db": -21.759,
+    "ratio3": 3.227,
+    "attack3_ms": 31.0,
+    "release3_ms": 248.295,
+    "zamcomp_3_on": 1.0,
+    "makeup_3_db": 0.532,
+    "crossover_freq_1_hz": 336.219,
+    "crossover_freq_2_hz": 6598.004,
+    "master_trim_db": 0.811
+  },
+  "ZL Compressor": {
+    "threshold_db_threshold_db": -30.968,
+    "ratio_ratio": 6.603,
+    "attack_attack": 58.676,
+    "release_release": 21.067,
+    "wet_wet": 89.743,
+    "range_range": 13.255
+  },
+  "TDR Nova": {
+    "band_1_active": true,
+    "band_1_frequency_hz": 3439.769,
+    "band_1_gain_db": 0.924,
+    "band_1_dyn": "On",
+    "band_1_threshold_db": -24.467,
+    "band_1_ratio": 3.524,
+    "band_1_attack_ms": 23.572,
+    "band_1_release_ms": 283.83,
+    "quality": "Eco"
+  },
+  "TDR Molotok": {
+    "attack_ms": 37.124,
+    "release_ms": 513.893,
+    "ratio": 2.739,
+    "sc_filter_freq_hz": 175.171,
+    "quality": "Eco"
+  },
+  "TDR VOS SlickEQ": {
+    "low_gain_db": 1.545,
+    "low_freq_hz": 198.45,
+    "mid_gain_db": -0.1,
+    "mid_freq_hz": 2698.244,
+    "high_gain_db": 3.361,
+    "high_freq_hz": 14243.218,
+    "auto_gain": true,
+    "quality": "Full"
+  }
+}

@@ -1,3 +1,4 @@
+import ctypes
 import json
 import math
 import sys
@@ -10,6 +11,7 @@ import soundfile
 
 import airwindows
 import native
+import prepared
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / ".agents" / "skills" / "analyze"))
@@ -29,15 +31,27 @@ MAX_TRUE_PEAK_DBTP = -1.0
 LUFS_TOLERANCE = 0.005
 MASTER_IN = "master-in"
 RESERVED = {MASTER_IN, "premaster", "trial"}
+LIBC = ctypes.CDLL(None)
+RAND_SEED = 1
 
 
-def load(step):
+def _load_plugin(bundle, **kwargs):
+    # Dragonfly and Airwindows draw on the process-wide C rand(), so without a fixed seed their output depends on
+    # how many plugins loaded before them in this process.
+    LIBC.srand(RAND_SEED)
+    return pedalboard.load_plugin(str(bundle), **kwargs)
+
+
+def load(step, rate=None, channels=None):
     name, settings = step["plugin"], dict(step["settings"])
     bundle = PLUGINS / f"{name}.vst3"
     if not bundle.exists():
         return getattr(pedalboard, name)(**settings)
+    prepared_key = prepared.key(bundle, settings, rate, channels)
+    if (plugin := prepared.load(bundle, prepared_key, _load_plugin)) is not None:
+        return plugin
     # A fresh instance per step: reset() does not clear every plugin's state, so reuse changes the sound.
-    plugin = pedalboard.load_plugin(str(bundle))
+    plugin = _load_plugin(bundle)
     if "effect" in settings:
         airwindows.select(plugin, settings.pop("effect"))
         # Switching effects keeps the previous effect's slot values, so an unset parameter is a leftover, not a default.
@@ -48,6 +62,7 @@ def load(step):
         if key not in plugin.parameters:
             sys.exit(f"step {step.get('id')}: {name} has no parameter {key}")
         setattr(plugin, key, value)
+    prepared.remember(plugin, prepared_key)
     return plugin
 
 
@@ -59,7 +74,7 @@ def process(audio, rate, steps, target, context):
         if step["plugin"] in NATIVE:
             audio = NATIVE[step["plugin"]](audio, rate, step["settings"], context)
         else:
-            plugin = load(step)
+            plugin = load(step, rate=rate, channels=max(2, audio.shape[1]))
             # Some VST3s accept only stereo, so a mono stem goes through them as two equal channels.
             mono = audio.shape[1] == 1 and isinstance(plugin, pedalboard.VST3Plugin)
             stereo = np.repeat(audio, 2, axis=1) if mono else audio
