@@ -40,7 +40,8 @@ def mix_part(recipe, reviewed_trial):
 
 
 def fingerprint(mix, outside):
-    return digest({"recipe": mix, "inputs": outside})
+    # Unsorted: render sums stems and orders buses and settings in recipe order, so order is part of the mix.
+    return sha(json.dumps({"recipe": mix, "inputs": outside}))
 
 
 def report_digest(numbers):

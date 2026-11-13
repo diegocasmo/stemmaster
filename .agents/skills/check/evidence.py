@@ -471,6 +471,15 @@ class Variants:
         return view
 
 
+def release(variants):
+    """Lets a finished check's renders go: each view's twin points back at its Variants, a cycle that would keep them."""
+    for view in variants.views.values():
+        view.twin = None
+    variants.views.clear()
+    variants.batteries.clear()
+    variants.ctx = variants.memo = None
+
+
 def node_tap(ctx, source):
     # Without a drums bus there is no one place to try a drum-bus move: the first drum's node is not the kit.
     if source == "drum-bus":
@@ -518,6 +527,17 @@ def unique_tag(recipe, base):
         n += 1
         tag = f"{base}-{n}"
     return tag
+
+
+def match_db(recipes, key, match_id):
+    step = next((s for s in recipes[key]["steps"] if s["id"] == match_id), None) if match_id else None
+    return step["settings"]["gain_db"] if step else None
+
+
+def set_match(recipes, key, match_id, gain_db):
+    step = next((s for s in recipes[key]["steps"] if s["id"] == match_id), None) if match_id and gain_db is not None else None
+    if step:
+        step["settings"]["gain_db"] = gain_db
 
 
 def match_trial(variants, key, target, match_id):
@@ -669,8 +689,7 @@ def outcome(record, needed, worked, has_pair):
 def judge(entry, needed_leaves, worked_leaves, needed, worked):
     record = entry["record"]
     decision = record.get("decision")
-    has_pair = "with" in entry["views"]
-    computed, part = outcome(record, needed, worked, has_pair)
+    computed, part = outcome(record, needed, worked, entry["has_pair"])
     fails = []
     override = record.get("override") or {}
     deciding = needed_leaves if part == "needed" else worked_leaves
@@ -770,7 +789,9 @@ def contract_path(recipe, variants, ctx, master_mode, records, entry):
     active = sorted({json.dumps([r.get("move"), r.get("decision")]) for r in records})
     variant_parts = {role: numeric(variants.recipes[key]) for role, key in entry["keys"].items()}
     # Taps come from every record, and a reading of an untapped name is None, so they are part of every key.
-    key = fingerprint(record_part(entry["record"]), entry["contract"], variant_parts, numeric(recipe), active,
+    # The override is left out: only judge reads it, and judge runs on every hit, so editing one re-reads nothing.
+    unoverridden = {key: value for key, value in entry["record"].items() if key != "override"}
+    key = fingerprint(record_part(unoverridden), entry["contract"], variant_parts, numeric(recipe), active,
                       sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
     return variants.cache / f"contract-{key}.json"
 
@@ -793,8 +814,10 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
             cached = json.loads(path.read_text())
             for source, summary in cached.pop("notes").items():
                 ctx.notes_summary.setdefault(source, summary)
-            # The key leaves out text, so text comes from the current record, never the cache.
-            out.append(cached | {"override": record.get("override")})
+            # --apply-defaults writes the trial as measured, so a cache hit must leave its matched gain in the variant too.
+            set_match(variants.recipes, keys.get("with"), entry.get("match"), cached.pop("match_db", None))
+            # The key leaves out text and the override, so both come from the current record, never the cache.
+            out.append(verdict(entry, cached))
             continue
         ctx.notes_read = []
         compare = entry["contract"].get("compare")
@@ -819,6 +842,7 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
             # A dropped blend leaves the recipe's own options in place: only whether they are the best is read.
             views["options_only"] = True
         entry["views"] = views
+        entry["has_pair"] = "with" in views
         if record.get("decision") in ("kept", "changed"):
             entry["engaged"] = engaged(views["with"], record.get("steps", []), recipe)
             if "nosend" in views:
@@ -842,20 +866,17 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
                                         "needed", needed_leaves)
         worked = outcome_tools.evaluate(entry["contract"]["worked"], record, views, fact, "worked", worked_leaves, on_with=True) \
             if "with" in views else None
-        computed, fails = judge(entry, needed_leaves, worked_leaves, needed, worked)
-        result = {"move": record["move"], "source": record["source"], "decision": record.get("decision"),
-                  "needed": needed, "worked": worked, "outcome": computed, "fails": fails,
-                  "needed_read_on": keys["base"], "with": keys.get("with"), "without": keys.get("without"),
-                  "engaged": entry.get("engaged", {}), "leaves": needed_leaves + worked_leaves, "override": record.get("override")}
-        result["read_at"] = ctx.acting
+        evaluated = {"needed": needed, "worked": worked, "needed_read_on": keys["base"], "with": keys.get("with"),
+                     "without": keys.get("without"), "engaged": entry.get("engaged", {}),
+                     "leaves": needed_leaves + worked_leaves, "read_at": ctx.acting, "has_pair": entry["has_pair"]}
         ctx.acting = ctx.join_recipe = ctx.record = None
         ctx.trial_ids = []
         # The sources this record read, in first-read order, so a cache hit adds them to the report as a cold run would.
         read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
         for source, summary in read.items():
             ctx.notes_summary.setdefault(source, summary)
-        write_atomic(path, json.dumps(result | {"notes": read}))
-        out.append(result)
+        write_atomic(path, json.dumps(evaluated | {"notes": read, "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))}))
+        out.append(verdict(entry, evaluated))
         # Readings are cached per record, and no record is read twice, so the current view would keep every record's.
         for view in [*variants.views.values(), *views.values()]:
             for one in view if isinstance(view, list) else [view]:
@@ -865,6 +886,19 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
     return sorted(out, key=lambda r: order[(r["move"], r["source"])])
+
+
+def verdict(entry, evaluated):
+    """A record's outcome and fails, judged from its evaluated leaves and its current decision and override."""
+    record = entry["record"]
+    leaves = evaluated["leaves"]
+    parts = ([leaf for leaf in leaves if leaf["id"].split(".")[0] == part] for part in ("needed", "worked"))
+    computed, fails = judge({"record": record, "contract": entry["contract"], "has_pair": evaluated["has_pair"],
+                             "engaged": evaluated["engaged"]}, *parts, evaluated["needed"], evaluated["worked"])
+    return {"move": record["move"], "source": record["source"], "decision": record.get("decision"),
+            "needed": evaluated["needed"], "worked": evaluated["worked"], "outcome": computed, "fails": fails,
+            "needed_read_on": evaluated["needed_read_on"], "with": evaluated["with"], "without": evaluated["without"],
+            "engaged": evaluated["engaged"], "leaves": leaves, "override": record.get("override"), "read_at": evaluated["read_at"]}
 
 
 def without_new_sends(recipe, variant):
@@ -924,6 +958,11 @@ def prepare(recipe, song, nodes, planned, outside):
 
 
 def report(recipe, song, nodes, master_mode=False):
+    return measured(recipe, song, nodes, master_mode)[:2]
+
+
+def measured(recipe, song, nodes, master_mode=False):
+    """The report, and the variants it judged each record on (a kept default reads its trial from them)."""
     cache = song / "renders" / "check"
     cache.mkdir(parents=True, exist_ok=True)
     planned = plan(recipe, song, nodes)
@@ -946,7 +985,7 @@ def report(recipe, song, nodes, master_mode=False):
                "notes": source_order(recipe, ctx.notes_summary), "current": current, "records": records, "contracts": contract}
     (cache / "report.json").write_text(json.dumps(numbers, indent=1))
     (cache / "report.md").write_text(markdown(numbers))
-    return cache / "report.md", numbers
+    return cache / "report.md", numbers, variants
 
 
 def intent_questions(recipe, song, ctx):
