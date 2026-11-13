@@ -162,6 +162,28 @@ def test_a_master_that_reads_a_file_is_measured_again_when_the_file_changes(tmp_
     assert isinstance(cold, list) and again == cold
 
 
+def test_a_rewritten_file_misses_the_exact_caches_too(tmp_path, monkeypatch):
+    import numpy as np
+    import soundfile
+
+    base = tmp_path / "base"
+    recipe = band(base, 1)
+    impulse = tmp_path / "ir.wav"
+    rng = np.random.default_rng(42)
+    soundfile.write(impulse, rng.normal(0, 0.02, (1024, 1)), 44100, subtype="FLOAT")
+    recipe["steps"].insert(next(i for i, s in enumerate(recipe["steps"]) if s.get("stage") == "master"),
+                           {"id": "master-ir", "target": "mix", "plugin": "Convolution", "stage": "master",
+                            "settings": {"impulse_response_filename": str(impulse), "mix": 1.0}})
+    next(r for r in recipe["moves"] if r["move"] == "mix-bus.trial-master")["steps"].append("master-ir")
+    check(base, recipe, tmp_path / "memo", monkeypatch)
+    soundfile.write(impulse, rng.normal(0, 0.9, (1024, 1)), 44100, subtype="FLOAT")
+
+    again, _ = check(base, recipe, tmp_path / "memo", monkeypatch)
+    cold, _ = check(cold_copy(base, tmp_path / "fresh"), recipe, tmp_path / "memo-fresh", monkeypatch)
+
+    assert isinstance(cold, list) and again == cold
+
+
 def test_a_trace_whose_recorded_value_changed_does_not_hold(tmp_path, monkeypatch):
     recipe = band(tmp_path, 1)
     check(tmp_path, recipe, tmp_path / "memo", monkeypatch)

@@ -63,8 +63,13 @@ def inputs(song, recipe):
     plugins = sorted(f for f in (ROOT / "plugins").rglob("*") if f.is_file())
     docs = sorted((ROOT / "docs" / "mixing-chains").glob("*.md"))
     profile = ROOT / "profiles" / str(recipe.get("profile")) / "profile.json"
-    return [content(CODE + docs), content(sorted((song / "stems").iterdir())), content(plugins),
-            content([profile]) if profile.exists() else None]
+    steps = recipe.get("steps", []) + [s for m in recipe.get("moves", []) for s in (m.get("trial") or {}).get("steps", [])]
+    read = sorted({path for step in steps for value in step.get("settings", {}).values() if isinstance(value, str)
+                   for path in (Path(value), ROOT / value, song / value) if path.is_file()})
+    found = [content(CODE + docs), content(sorted((song / "stems").iterdir())), content(plugins),
+             content([profile]) if profile.exists() else None]
+    # A step that reads a file (an impulse response) is keyed by the file's bytes, not its path.
+    return found + [[str(path), content([path])] for path in read] if read else found
 
 
 def fingerprint(*parts):
