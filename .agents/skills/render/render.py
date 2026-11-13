@@ -13,6 +13,7 @@ import sys
 import time
 from importlib import metadata
 from pathlib import Path
+from stat import S_ISREG
 
 import numpy as np
 import pedalboard
@@ -185,11 +186,17 @@ class Memo:
     def path(self, key):
         return self.folder / f"{self.tag}-{key}.npy"
 
+    def used(self, path):
+        # The marker is dated with its file, so least recently used eviction takes the file before its marker.
+        with contextlib.suppress(OSError):
+            os.utime(path.with_suffix(".seen"), follow_symlinks=False)
+
     def get(self, key):
         path = self.path(key)
         # Any error is a miss: numpy's header parser can raise almost anything on damaged bytes.
         try:
-            with open(path, "rb") as file:
+            # Nothing the memo opens or creates follows a link: one planted in the folder could point anywhere.
+            with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as file:
                 size = os.fstat(file.fileno()).st_size
                 header = file.read(10)
                 header += file.read(int.from_bytes(header[8:10], "little"))
@@ -212,12 +219,13 @@ class Memo:
                 data = bytearray(size - len(header))
                 if file.readinto(data) != len(data):
                     return None
-            content = hashlib.sha256(header)
-            content.update(memoryview(data)[:-32])
-            if content.digest() != data[-32:]:
-                return None
+                content = hashlib.sha256(header)
+                content.update(memoryview(data)[:-32])
+                if content.digest() != data[-32:]:
+                    return None
+                os.utime(file.fileno())
             audio = np.frombuffer(data, np.float64, math.prod(shape))
-            os.utime(path)
+            self.used(path)
         except Exception:
             return None
         return audio.reshape(shape, order="F" if fortran else "C")
@@ -235,22 +243,31 @@ class Memo:
         try:
             if size > self.cap or shutil.disk_usage(self.folder).free < size + MEMO_SPARE_BYTES:
                 return
-            seen = path.with_suffix(".seen")
-            if self.sightings > 1 and not seen.exists():
-                seen.touch()
-                self.evict()
-                return
+            if self.sightings > 1:
+                seen = path.with_suffix(".seen")
+                try:
+                    # A marker costs one block, so eviction waits for the next store.
+                    os.close(os.open(seen, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644))
+                    return
+                except FileExistsError:
+                    if not S_ISREG(seen.lstat().st_mode):
+                        return
             content = hashlib.sha256(header)
             content.update(layout(audio))
-            with open(temp, "wb") as file:
-                file.write(header)
-                file.write(layout(audio))
-                file.write(content.digest())
-            os.replace(temp, path)
+            descriptor = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+            try:
+                with open(descriptor, "wb") as file:
+                    file.write(header)
+                    file.write(layout(audio))
+                    file.write(content.digest())
+                os.replace(temp, path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    temp.unlink()
+                return
         except OSError:
-            with contextlib.suppress(OSError):
-                temp.unlink(missing_ok=True)
             return
+        self.used(path)
         self.evict()
 
     def evict(self):
@@ -267,7 +284,7 @@ class Memo:
                     used = stat.st_mtime_ns if stat.st_mtime_ns <= now else 0
                     tag = name[1]
                     newest[tag] = max(newest.get(tag, 0), used)
-                    files.append((tag, used, MEMO_BLOCK_BYTES if name[2] == ".seen" else stat.st_size, entry.path))
+                    files.append((tag, used, max(stat.st_size, MEMO_BLOCK_BYTES) if name[2] == ".seen" else stat.st_size, entry.path))
             except OSError:
                 pass
         # Another worktree's check may be running now, so its files are stale only once it has written nothing for a day.

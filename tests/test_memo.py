@@ -644,7 +644,6 @@ def test_a_bundle_with_an_unreadable_folder_has_no_loader(tmp_path, monkeypatch)
         (tmp_path / "X.vst3" / "Contents").chmod(0o700)
 
 
-
 def test_foreign_files_in_the_memo_folder_survive_eviction(tmp_path):
     folder = tmp_path / "nodes"
     folder.mkdir()
@@ -719,7 +718,6 @@ def test_a_stale_pyc_turns_the_memo_off(tmp_path):
     assert imported() == ["20", "False"]
 
 
-
 def test_an_output_is_stored_on_its_second_computation_and_reused_on_its_third(stems):
     suffixes = []
     for ran, reused in ((MIX_STEPS, 0), (MIX_STEPS, 0), (0, MIX_STEPS)):
@@ -734,6 +732,41 @@ def test_seen_markers_count_toward_the_cap_and_go_least_recently_used_first(tmp_
     memo = render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)
     for key in "abc":
         memo.put(K[key], AUDIO)
-    assert kept(memo) == ["b.seen", "c.seen"]
+    assert kept(render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)) == ["b.seen", "c.seen"]
     memo.put(K["a"], AUDIO)
-    assert memo.get(K["a"]) is None and kept(memo) == ["a.seen", "c.seen"]
+    assert memo.get(K["a"]) is None and kept(memo) == ["a.seen", "b.seen", "c.seen"]
+
+
+def test_a_marker_is_charged_its_real_size(tmp_path):
+    memo = render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)
+    memo.put(K["a"], AUDIO)
+    memo.path(K["a"]).with_suffix(".seen").write_bytes(bytes(4 * render.MEMO_BLOCK_BYTES))
+    assert kept(render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)) == []
+
+
+def test_a_stored_or_reused_file_keeps_its_marker_newer_than_it(tmp_path):
+    memo = render.Memo(tmp_path, FILE + render.MEMO_BLOCK_BYTES)
+    for _ in range(2):
+        memo.put(K["a"], AUDIO)
+    days_ago(memo.path(K["a"]).with_suffix(".seen"), 2)
+    assert memo.get(K["a"]) is not None
+    stats = [memo.path(K["a"]).with_suffix(suffix).stat().st_mtime_ns for suffix in (".npy", ".seen")]
+    assert stats[1] >= stats[0]
+
+
+def test_nothing_the_memo_creates_or_reads_follows_a_planted_link(song, tmp_path, monkeypatch):
+    recipe = gain_recipe(song)
+    monkeypatch.setattr(render, "PLUGINS", tmp_path / "plugins")
+    memo = nodes(song, sightings=2)
+    render.Result(recipe, song, memo=memo)
+    for path in memo.folder.iterdir():
+        path.unlink()
+        path.symlink_to(tmp_path / "plugins" / "Gain.vst3")
+        path.with_name(f"{path.stem}.{os.getpid()}.tmp").symlink_to(tmp_path / "elsewhere")
+    stored = nodes(song, sightings=1)
+    stored.put(K["a"], AUDIO)
+    stored.path(K["b"]).symlink_to(stored.path(K["a"]))
+    for memo in (nodes(song, sightings=2), nodes(song, sightings=1)):
+        assert outputs(recipe, song, memo, probes=()) == outputs(recipe, song, None, probes=())
+    assert not (tmp_path / "plugins").exists() and not (tmp_path / "elsewhere").exists()
+    assert stored.get(K["b"]) is None
