@@ -197,9 +197,12 @@ def loudness(audio, rate):
 
 def matched_master(result, target):
     """Finds the mix gain that brings the trial to `target` LUFS, bracketing it so a compressor can't stall the search."""
+    ids = {step.get("id") for step in result.master_steps}
+
     def trial(gain_db):
         master_in, out = result.master(result.mix * 10 ** (gain_db / 20))
-        return master_in, out, loudness(out, result.rate) - target
+        probed = {key: value for key, value in result.mixer.probed.items() if key in ids}
+        return master_in, out, loudness(out, result.rate) - target, probed
 
     def score(error):
         return abs(error) if np.isfinite(error) else np.inf
@@ -224,7 +227,9 @@ def matched_master(result, target):
         if not low < gain < high:
             gain = (low + high) / 2
         error = tried(gain)
-    best, (master_in, out, error) = best
+    best, (master_in, out, error, probed) = best
+    # Each pass rewrote the master steps' probes, so the best drive's come back: the last tried may not be the best.
+    result.mixer.probed.update(probed)
     return {"drive_change_db": round(best, 2), "residual_lu": measure.rounded(error),
             "matched": bool(np.isfinite(error) and abs(error) <= MATCH_LU)}, master_in, out
 

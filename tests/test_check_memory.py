@@ -157,7 +157,7 @@ def clipper(ceiling, calls):
     def master(mix):
         calls.append(float(np.abs(mix).max()))
         return mix, np.clip(mix, -ceiling, ceiling)
-    return SimpleNamespace(rate=RATE, mix=audio, master=master)
+    return SimpleNamespace(rate=RATE, mix=audio, master=master, master_steps=[], mixer=SimpleNamespace(probed={}))
 
 
 @pytest.mark.parametrize("ceiling, target", [(1.0, -14), (0.05, -6), (0.05, -60), (1e-9, -14)],

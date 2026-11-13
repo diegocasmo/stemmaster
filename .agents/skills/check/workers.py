@@ -106,8 +106,8 @@ def budget(need, n, keep=0, share=BUDGET_SHARE, free=None, total=None):
 
 
 def record(cache, signal_bytes, taps, peaks):
-    """Keeps this song's largest worker peak per tapped signal; each peak leaves out only the taps held in memory when
-    it was reached. Bookkeeping only: it never fails the check."""
+    """Keeps this song's largest worker peak per tapped signal, its whole resident peak: subtracting the taps it held
+    could understate a worker whose arrays are shared. Bookkeeping only: it never fails the check."""
     import evidence
 
     try:
@@ -194,7 +194,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                     evidence.progress(f"workers stopped: {type(future.exception()).__name__}: {future.exception()}")
                     return
                 peak, seconds, kept = future.result()
-                peaks.append(peak - kept)
+                peaks.append(peak)
                 done += 1
                 evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future]}... {seconds:.0f} s), worker peak {peak >> 20} MB")
                 if waiting:
