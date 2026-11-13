@@ -111,3 +111,48 @@ def test_a_cut_of_a_ride_renders(song, segments, settings, window):
     path = cut.cut(song / "recipe.json", window)
 
     render.Result(json.loads(path.read_text()), path.parent)
+
+
+@pytest.mark.parametrize("key", ["absolute", "../stems/kick.wav", "sub/kick.wav", ".."])
+def test_a_cut_never_writes_a_stem_outside_its_folder(song, key):
+    write(song, "kick.wav", noise(10))
+    key = str(song / "stems" / "kick.wav") if key == "absolute" else key
+    (song / "recipe.json").write_text(json.dumps({"stems": {key: {}}}))
+
+    with pytest.raises(SystemExit, match="outside"):
+        cut.cut(song / "recipe.json", ["2", "6"])
+
+    assert soundfile.info(song / "stems" / "kick.wav").frames == 10 * RATE and not (song / "renders").exists()
+
+
+def test_a_cut_keeps_a_ride_whose_ramp_reaches_into_its_end(song):
+    write(song, "kick.wav", noise(10))
+    recipe = {"stems": {"kick.wav": {}}, "steps": [ride([[8, 10, 6]], ramp_ms=2000)]}
+    (song / "recipe.json").write_text(json.dumps(recipe))
+
+    path = cut.cut(song / "recipe.json", ["2", "8"])
+
+    out = json.loads(path.read_text())
+    assert out["steps"][0]["settings"]["segments"] == [[6, 8, 6]]
+    np.testing.assert_allclose(render.Result(out, path.parent).mix, render.Result(recipe, song).mix[2 * RATE : 8 * RATE])
+
+
+def test_a_cut_keeps_an_interior_ride_as_long_as_its_ramp(song):
+    write(song, "kick.wav", noise(20))
+    recipe = {"stems": {"kick.wav": {}}, "steps": [ride([[16, 17.1, 6]], ramp_ms=1100)]}
+    (song / "recipe.json").write_text(json.dumps(recipe))
+
+    path = cut.cut(song / "recipe.json", ["0.9", "20"])
+
+    out = json.loads(path.read_text())
+    whole = render.Result(recipe, song).mix
+    np.testing.assert_allclose(render.Result(out, path.parent).mix, whole[round(0.9 * RATE) :], atol=1e-12)
+
+
+def test_a_cut_says_which_ride_segment_it_drops_and_why(song, capsys):
+    write(song, "kick.wav", noise(10))
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "steps": [ride([[1, 3.5, -2]], ramp_ms=1000)]}))
+
+    cut.cut(song / "recipe.json", ["3", "8"])
+
+    assert "segment [1, 3.5, -2] starts before the cut, and the 500 ms left in it are under its ramp_ms 1000" in capsys.readouterr().err
