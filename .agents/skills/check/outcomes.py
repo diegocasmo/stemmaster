@@ -14,6 +14,7 @@ import hits as hit_tools
 import measure
 import notes as note_tools
 from analyze import BAND_CENTERS_HZ
+from memo import memoized
 
 import contracts
 from structure import DRUM_CHAINS, Routing, roles_of
@@ -499,6 +500,17 @@ def drums_bus(ctx):
     return next((bus for bus in shared if ctx.routing.stems_into(bus) == drum_stems), None)
 
 
+@memoized
+def signal_hit_stats(audio, rate, times):
+    return hit_tools.measure(audio, rate, times, include_off_hit=False)
+
+
+@memoized
+def signal_lufs(audio, rate):
+    value = pyloudnorm.Meter(rate).integrated_loudness(audio)
+    return value if math.isfinite(value) else None
+
+
 class View:
 
     def __init__(self, ctx, result, master=None, recipe=None):
@@ -564,7 +576,7 @@ class View:
             times = self.events(events, source, window)
             if audio is None or times is None or not len(times):
                 return None
-            return hit_tools.measure(audio, self.rate, times)
+            return signal_hit_stats(audio, self.rate, times)
         return self.memo(("hits", point, source, events, window), compute)
 
     def events(self, events, source, window=None):
@@ -581,8 +593,7 @@ class View:
             audio = self.audio(point, source)
             if audio is None:
                 return None
-            value = pyloudnorm.Meter(self.rate).integrated_loudness(audio)
-            return value if math.isfinite(value) else None
+            return signal_lufs(audio, self.rate)
         return self.memo(("lufs", point, source), compute)
 
 

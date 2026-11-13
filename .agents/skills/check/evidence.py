@@ -3,6 +3,7 @@ import functools
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ import render
 from analyze import bands_db, measure as analyze_file, stereo
 import hits as hit_tools
 import measure
+from memo import memoized
 
 import contracts
 import outcomes as outcome_tools
@@ -36,7 +38,7 @@ OWN_HIT_DB = 6
 OWN_GROUP_MIN = 3
 CODE = [ROOT / ".agents" / "skills" / path for path in (
     "render/render.py", "render/native.py", "render/airwindows.py",
-    "analyze/analyze.py", "analyze/hits.py", "analyze/measure.py", "analyze/notes.py", "align/align.py",
+    "analyze/analyze.py", "analyze/hits.py", "analyze/measure.py", "analyze/memo.py", "analyze/notes.py", "align/align.py",
     "check/evidence.py", "check/structure.py", "check/chains.py", "check/contracts.py", "check/outcomes.py",
 )]
 
@@ -184,6 +186,7 @@ def matched_master(result, target):
             "matched": bool(np.isfinite(error) and abs(error) <= MATCH_LU)}, master_in, out
 
 
+@memoized
 def observe(audio, rate, hits, sections):
     level = loudness(audio, rate)
     entry = {"integrated_lufs": measure.rounded(level), "bands_db": bands_db([audio], rate)["bands_db"],
@@ -286,6 +289,12 @@ def plan(recipe, song, nodes):
 
 
 MAX_VIEWS = 3
+STARTED = time.monotonic()
+RENDERS = [0]
+
+
+def progress(message):
+    print(f"check: {message}, {time.monotonic() - STARTED:.0f} s", file=sys.stderr, flush=True)
 
 
 class Variants:
@@ -360,6 +369,8 @@ class Variants:
         view.probed = result.mixer.probed
         view.twin = lambda other: self.view(self.add(recipe_key(other), other))
         self.views[key] = view
+        RENDERS[0] += 1
+        progress(f"{RENDERS[0]} variant renders")
         return view
 
 
@@ -656,7 +667,9 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
     variants.taps.discard(None)
     out = []
     # Records that share a variant run together, so each render is made once and dropped once.
-    for entry in sorted(entries, key=lambda e: str(e["keys"].get("without", "")) + str(e["keys"].get("with", ""))):
+    ordered = sorted(entries, key=lambda e: str(e["keys"].get("without", "")) + str(e["keys"].get("with", "")))
+    for done, entry in enumerate(ordered, 1):
+        progress(f"contract {done}/{len(ordered)}")
         record, keys = entry["record"], entry["keys"]
         path = variants.cache / f"contract-{fingerprint(record, entry['contract'], {r: variants.recipes[k] for r, k in keys.items()}, variants.outside, ctx.times, ctx.target, master_mode)}.json"
         if path.exists():
@@ -758,6 +771,7 @@ def report(recipe, song, nodes, master_mode=False):
     boundary = masters[-1].get("id") if masters else None
     ctx = outcome_tools.Context(recipe, song, nodes, Routing(recipe), times)
     records_all = [r for r in recipe.get("moves", []) if r.get("move") != "balance"]
+    progress(f"report on {len(records_all)} moves")
     kinds = {field: kind for field, (_, kind) in fields_of(recipe).items()}
     records = []
     for record in records_all:
@@ -777,7 +791,8 @@ def report(recipe, song, nodes, master_mode=False):
     variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all), published)
     contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
     current = variants.battery("current")
-    for entry in records:
+    for done, entry in enumerate(records, 1):
+        progress(f"off {done}/{len(records)}")
         if isinstance(entry["off"], str):
             entry["off"] = variants.battery(entry["off"])
     numbers = {"timing_stems": timing_stems, "hits": counts, "windows": windows_summary(ctx), "questions": intent_questions(recipe, song, ctx),

@@ -7,6 +7,8 @@ import pyloudnorm
 import soundfile
 from scipy import signal
 
+from memo import memoized
+
 BAND_CENTERS_HZ = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 SHORT_TERM_SECONDS = 3.0
 SHORT_TERM_HOP_SECONDS = 0.1
@@ -139,6 +141,7 @@ def loudness(audio, rate):
     return fields, short_term, hop
 
 
+@memoized
 def measure(audio, rate, loud=False):
     if len(audio) == 0 or audio.shape[1] > 2:
         raise ValueError("needs non-empty mono or stereo audio")
