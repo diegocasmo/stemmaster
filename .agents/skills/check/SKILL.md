@@ -3,7 +3,7 @@ name: check
 description: Check that a song's recipe records every chain move for every source, and compute the measured report reviewers judge it by. Use before any mix or master review.
 ---
 
-- Run `uv run .agents/skills/check/check.py [--master | --review-prompt] songs/<id>/recipe.json`. It writes `renders/check/report.md` and `report.json`, prints every `review:` question and `fail:`, and exits 1 on any failure. `--no-report` runs only the structural checks.
+- Run `uv run .agents/skills/check/check.py [--master | --review-prompt | --apply-defaults] songs/<id>/recipe.json`. It writes `renders/check/report.md` and `report.json`, prints every `review:` question and `fail:`, and exits 1 on any failure. `--no-report` runs only the structural checks.
 - Run long checks in the background and wait for that job's own completion notice and exit status.
 - Progress and elapsed seconds go to stderr. Never wait with a `pgrep -f` loop: it can match its own shell.
 - It lints the `### <chain>.<move>` headings of `docs/mixing-chains/` and reads each move's **Tool** list.
@@ -28,6 +28,11 @@ description: Check that a song's recipe records every chain move for every sourc
   - Notes (bass, guitars, synths) are found on each played stem by spectral flux, and each is read only up to the next note. Palm mutes can't be told from open chords on an amp track, so those leaves are review questions.
   - Each leaf is true, false, unresolved (no supported evidence), review (the doc gives no number: a question the reviewers must answer) or skipped (no profile).
   - Default outcome: no fault → dropped; fault and it worked → kept; fault and it didn't → dropped.
+- Start from the defaults: `--apply-defaults` writes each record's default outcome into the recipe, then checks it again. Override a default only with a measured reason.
+  - A record with no fault is dropped and its steps and sends removed. A trial that worked is kept with its steps, buses and sends exactly as measured, a starting trial with its matched `Gain`. With `--master`, only master moves.
+  - Overrides, records with no default (unresolved, review, needs a trial), a kept move whose Worked if fails, and steps another kept record claims stay as written; each is printed as `left:` with why. Notes stay too: update them.
+  - A change can move other records' defaults, so it repeats, at most 3 rounds, never changing a record twice. One whose default flips after it was applied is left for you.
+  - The recipe must be `json.dumps(indent=2)` with a final newline, so the diff is only the records it decided.
 - The check fails a record when its outcome is unresolved, when its decision contradicts the default outcome, when a fault was found and the move was dropped without a trial, and when a claimed step or trial does nothing (under -40 dB residual after aligning and matching it to its own input).
   - `override: {"reason": "...", "leaves": [ids]}` accepts a contradiction only when it names every leaf that decided it. It never answers unresolved evidence or an ineffective step. Overrides go to the reviewers.
   - Always-tried moves dropped are judged by the check's own starting trial (`DEFAULT_TRIALS`). Another dropped move whose Needed if finds a fault needs `trial`: `{"steps": [{..., "before" or "after": <step id>}], "buses": {...}, "sends": {<own stem or bus>: [...]}, "routing": {<own stem>: <bus>}}`. A record trial that fails needs an override naming its failing leaves.
