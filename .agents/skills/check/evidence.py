@@ -836,7 +836,7 @@ def windows_summary(ctx):
 def source_order(recipe, summary):
     # Contracts run in cache-key order, which says nothing about the song, so the report lists sources as the recipe does.
     order = {source: i for i, source in enumerate(recipe.get("sources", {}))}
-    return dict(sorted(summary.items(), key=lambda item: order.get(item[0], len(order))))
+    return dict(sorted(summary.items(), key=lambda item: order[item[0]]))
 
 
 def notes_tool_summary(found):
