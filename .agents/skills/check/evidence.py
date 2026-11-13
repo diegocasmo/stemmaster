@@ -2,6 +2,7 @@ import copy
 import functools
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -231,7 +232,32 @@ def observe(audio, rate, hits, sections):
     return entry
 
 
-def battery(recipe, result, points, times, chain_nodes, target):
+class Master:
+    """A render's trial master, made on first read: matching it to the target runs the master chain several times."""
+
+    def __init__(self, result, target):
+        self.result, self.target, self.made = result, target, None
+
+    def make(self):
+        if self.made is None:
+            if self.target is None:
+                master_in, trial = self.result.master(self.result.mix)
+                self.made = {"drive_change_db": 0.0, "matched": False}, master_in, trial
+            else:
+                self.made = matched_master(self.result, self.target)
+        return self.made
+
+    def get(self, name):
+        if not self.result.master_steps:
+            return None
+        # An unmatched master is never read, so it is made only for the battery's numbers.
+        if name == "matched" and self.target is None:
+            return False
+        numbers, master_in, trial = self.make()
+        return {"matched": numbers["matched"], "trial": trial, "master-in": master_in}[name]
+
+
+def battery(recipe, result, points, times, chain_nodes, master):
     rate, out = result.rate, {}
     for label, (tap, hits) in points.items():
         out[label] = observe(result.tapped[tap], rate, hits, recipe.get("sections"))
@@ -251,19 +277,16 @@ def battery(recipe, result, points, times, chain_nodes, target):
             out[f"overlap.{first}.{second}.on_{on_hits}_hits"] = measure.overlap(*pair, rate, bands, inside)
     if not result.master_steps:
         out["trial"] = {"skipped": "no master steps"}
-        return out, {}
-    if target is None:
-        master_in, trial = result.master(result.mix)
-        out["trial"] = {"drive_change_db": 0.0, "matched": False}
-    else:
-        out["trial"], master_in, trial = matched_master(result, target)
+        return out
+    numbers, master_in, trial = master.make()
+    out["trial"] = dict(numbers)
     out["trial"] |= {"integrated_lufs": measure.rounded(loudness(trial, rate)),
                      "true_peak_dbtp": measure.rounded(render.true_peak_dbtp(trial))}
     for chain in ("kick", "snare"):
         if len(times.get(chain, [])):
             out["trial"][f"dip_{chain}"] = measure.dip(master_in, trial, rate, times[chain])
     out["trial"]["range"] = measure.profile_range(trial, rate, recipe.get("profile"))
-    return out, {"trial": trial, "master-in": master_in, "matched": out["trial"]["matched"]}
+    return out
 
 
 def plan(recipe, song, nodes):
@@ -303,14 +326,35 @@ def progress(message):
     print(f"check: {message}, {time.monotonic() - STARTED:.0f} s", file=sys.stderr, flush=True)
 
 
-class Variants:
+def node_memo():
+    megabytes = os.environ.get("STEMMASTER_NODE_MEMO_MB", str(render.MEMO_BYTES >> 20))
+    try:
+        megabytes = int(megabytes)
+    except ValueError:
+        sys.exit(f"STEMMASTER_NODE_MEMO_MB must be a whole number of MB (0 turns the memo off), not {megabytes!r}")
+    if megabytes <= 0:
+        return None
+    folder = os.environ.get("STEMMASTER_NODE_MEMO_DIR")
+    try:
+        folder = folder or render.memo_folder()
+        return render.Memo(folder, megabytes << 20)
+    except Exception as error:
+        print(f"warning: node memo off, can't use {folder}: {error}", file=sys.stderr)
+        return None
 
-    def __init__(self, recipe, song, cache, layout, boundary, outside, ctx, taps):
+
+class Variants:
+    """A view renders its variant. A battery is measured only for a key the report publishes, and a matched master only
+    when a reading or a battery needs one."""
+
+    def __init__(self, recipe, song, cache, layout, boundary, outside, ctx, taps, published):
         self.recipe, self.song, self.cache, self.layout = recipe, song, cache, layout
         self.boundary, self.outside, self.ctx, self.taps = boundary, outside, ctx, taps
         self.views, self.batteries, self.probes = {}, {}, {}
         self.recipes = {"current": recipe}
         self.target = ctx.target
+        self.memo = node_memo()
+        self.published = set(published)
 
     def add(self, key, variant, probes=None):
         self.recipes.setdefault(key, variant)
@@ -328,8 +372,17 @@ class Variants:
             if path.exists():
                 self.batteries[key] = json.loads(path.read_text())
             else:
-                self.view(key)
+                view = self.view(key)
+                numbers = battery(self.recipe, view.result, *self.layout, view.master)
+                path.write_text(json.dumps(numbers))
+                self.batteries[key] = numbers
         return self.batteries[key]
+
+    def drop(self, key):
+        # A published battery is measured before its render goes, so it never needs a second render.
+        if key in self.published:
+            self.battery(key)
+        del self.views[key]
 
     def view(self, key):
         if key in self.views:
@@ -337,17 +390,29 @@ class Variants:
         # The current view stays; the others are dropped oldest first, since each render holds every tap.
         others = [k for k in self.views if k != "current"]
         while len(others) >= MAX_VIEWS - 1:
-            del self.views[others.pop(0)]
+            self.drop(others.pop(0))
         variant = self.recipes[key]
         plugins = {step.get("id"): step["plugin"] for step in variant.get("steps", [])}
         probe = {"Duck": outcome_tools.duck_depth, "Ride": outcome_tools.gain_change, "Gain": outcome_tools.gain_change,
                  "Delay": functools.partial(outcome_tools.engagement, align=False)}
         probes = {step_id: probe.get(plugins.get(step_id), outcome_tools.engagement) for step_id in self.probes.get(key, {})}
         taps = sorted(({tap for tap, _ in self.layout[0].values()} | self.taps) & set(render.sources(variant)))
-        result = render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary, probes=probes)
-        numbers, master = battery(self.recipe, result, *self.layout, self.target)
-        self.battery_path(key).write_text(json.dumps(numbers))
-        self.batteries[key] = numbers
+        result = render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary, probes=probes,
+                               memo=self.memo)
+        points, _, chain_nodes = self.layout
+        # A battery reads every observation tap, so a variant that loses one fails here even when none is measured.
+        for tap in [tap for tap, _ in points.values()] + [node for first, second, _, _ in OVERLAPS for chain in (first, second)
+                                                          for node in chain_nodes.get(chain, [])]:
+            result.tapped[tap]
+        master = Master(result, self.target)
+        if set(probes) & {step.get("id") for step in result.master_steps}:
+            # Each master pass rewrites its steps' probes, so the matched master runs first, before any other pass.
+            master.make()
+        else:
+            # A master no reading needs may never run, yet its bad settings must still fail here.
+            for step in result.master_steps:
+                if step["plugin"] not in render.NATIVE:
+                    render.load(step)
         view = outcome_tools.View(self.ctx, result, master, variant)
         # A copy: a later master render (a contract reading the actual master) writes its probes into the mixer, and
         # every contract must read the same matched-drive probes whatever order the contracts run in.
@@ -770,13 +835,9 @@ def report(recipe, song, nodes, master_mode=False):
     boundary = masters[-1].get("id") if masters else None
     ctx = outcome_tools.Context(recipe, song, nodes, Routing(recipe), times)
     records_all = [r for r in recipe.get("moves", []) if r.get("move") != "balance"]
-    variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all))
     progress(f"report on {len(records_all)} moves")
-    contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
-    current = variants.battery("current")
-    records = []
-    measured = [r for r in records_all if r.get("decision") in ("kept", "changed")]
     kinds = {field: kind for field, (_, kind) in fields_of(recipe).items()}
+    records = []
     for record in records_all:
         if record.get("decision") not in ("kept", "changed"):
             continue
@@ -785,12 +846,19 @@ def report(recipe, song, nodes, master_mode=False):
         kept_on = [field for field in record.get("fields", []) if kinds.get(field, field.rsplit(".", 1)[-1]) in ("gain_db", "bus")]
         if kept_on:
             entry["kept_on_in_off"] = kept_on
-        progress(f"off {len(records) + 1}/{len(measured)}")
         if not record.get("steps") and len(kept_on) == len(record.get("fields", [])):
             entry["off"] = {"skipped": "claims only gain_db or bus, which have no off state"}
         else:
-            entry["off"] = variants.battery(off_key(recipe, record))
+            entry["off"] = off_key(recipe, record)
         records.append(entry)
+    published = {"current"} | {entry["off"] for entry in records if isinstance(entry["off"], str)}
+    variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all), published)
+    contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
+    current = variants.battery("current")
+    for done, entry in enumerate(records, 1):
+        progress(f"off {done}/{len(records)}")
+        if isinstance(entry["off"], str):
+            entry["off"] = variants.battery(entry["off"])
     numbers = {"timing_stems": timing_stems, "hits": counts, "windows": windows_summary(ctx), "questions": intent_questions(recipe, song, ctx),
                "notes": source_order(recipe, ctx.notes_summary), "current": current, "records": records, "contracts": contract}
     (cache / "report.json").write_text(json.dumps(numbers, indent=1))
