@@ -164,9 +164,6 @@ class Context:
 
     def source_notes(self, source):
         """Notes of each played stem, found on that stem itself (DIs are never used)."""
-        # Listed on every read, not only the first: a cached contract must replay every source it reads.
-        if source not in self.notes_read:
-            self.notes_read.append(source)
         if source not in self.notes:
             import soundfile
 
@@ -176,6 +173,10 @@ class Context:
                 placed = render.place(audio, self.recipe["stems"][stem].get("offset_samples", 0), self.length)
                 found.append(note_tools.measure(placed, self.rate, note_tools.onsets(placed, self.rate)))
             self.notes[source] = {"performances": found}
+        # Listed on every read, not only the first: a cached contract must replay every source it reads. A failed
+        # read raises before this, so it adds nothing to the summary, as a cold run would.
+        if source not in self.notes_read:
+            self.notes_read.append(source)
         return self.notes[source]
 
     def events(self, name, source):

@@ -150,3 +150,21 @@ def test_a_note_edit_gives_the_same_report_bytes(bass, song, check):
     assert renders == 0
     assert list(cold["notes"]) == ["bass", "guitars"]
     assert [(report / name).read_bytes() for name in ("report.json", "report.md")] == files
+
+
+def test_a_failed_note_read_is_unresolved_and_left_out_of_the_notes(song):
+    # Too short for the note-onset STFT window, so note detection raises.
+    write(song, "Bass.wav", noise(1024 / 48000, seed=1))
+    recipe = {
+        "stems": {"Bass.wav": {"bus": "bass"}},
+        "buses": {"bass": {}},
+        "sources": {"bass": {"chain": "bass", "stems": ["Bass.wav"]}},
+        "steps": [],
+        "moves": [{"move": "bass.hpf", "source": "bass", "decision": "dropped", "steps": [], "fields": []}],
+    }
+    nodes = structure.nodes(recipe, structure.Routing(recipe), [])
+
+    numbers = evidence.report(recipe, song, nodes)[1]
+
+    assert numbers["notes"] == {}
+    assert numbers["contracts"][0]["needed"] == "unresolved"
