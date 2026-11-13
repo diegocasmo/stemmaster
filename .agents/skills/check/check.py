@@ -6,7 +6,7 @@ import chains
 import contracts
 import review
 import structure
-from evidence import inputs, render, report
+from evidence import inputs, progress, render, report
 
 USAGE = "usage: uv run .agents/skills/check/check.py [--master | --review-prompt] [--no-report] songs/<id>/recipe.json"
 FLAGS = ("--master", "--no-report", "--review-prompt")
@@ -88,4 +88,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        progress("done")

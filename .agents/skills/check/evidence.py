@@ -3,6 +3,7 @@ import functools
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -266,6 +267,12 @@ def plan(recipe, song, nodes):
 
 
 MAX_VIEWS = 3
+STARTED = time.monotonic()
+RENDERS = [0]
+
+
+def progress(message):
+    print(f"check: {message}, {time.monotonic() - STARTED:.0f} s", file=sys.stderr, flush=True)
 
 
 class Variants:
@@ -317,6 +324,8 @@ class Variants:
         view.probed = result.mixer.probed
         view.twin = lambda other: self.view(self.add(recipe_key(other), other))
         self.views[key] = view
+        RENDERS[0] += 1
+        progress(f"{RENDERS[0]} variant renders")
         return view
 
 
@@ -613,7 +622,9 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
     variants.taps.discard(None)
     out = []
     # Records that share a variant run together, so each render is made once and dropped once.
-    for entry in sorted(entries, key=lambda e: str(e["keys"].get("without", "")) + str(e["keys"].get("with", ""))):
+    ordered = sorted(entries, key=lambda e: str(e["keys"].get("without", "")) + str(e["keys"].get("with", "")))
+    for done, entry in enumerate(ordered, 1):
+        progress(f"contract {done}/{len(ordered)}")
         record, keys = entry["record"], entry["keys"]
         path = variants.cache / f"contract-{fingerprint(record, entry['contract'], {r: variants.recipes[k] for r, k in keys.items()}, variants.outside, ctx.times, ctx.target, master_mode)}.json"
         if path.exists():
@@ -716,9 +727,11 @@ def report(recipe, song, nodes, master_mode=False):
     ctx = outcome_tools.Context(recipe, song, nodes, Routing(recipe), times)
     records_all = [r for r in recipe.get("moves", []) if r.get("move") != "balance"]
     variants = Variants(recipe, song, cache, layout, boundary, inputs(song, recipe), ctx, contract_taps(ctx, records_all))
+    progress(f"report on {len(records_all)} moves")
     contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
     current = variants.battery("current")
     records = []
+    measured = [r for r in records_all if r.get("decision") in ("kept", "changed")]
     kinds = {field: kind for field, (_, kind) in fields_of(recipe).items()}
     for record in records_all:
         if record.get("decision") not in ("kept", "changed"):
@@ -728,6 +741,7 @@ def report(recipe, song, nodes, master_mode=False):
         kept_on = [field for field in record.get("fields", []) if kinds.get(field, field.rsplit(".", 1)[-1]) in ("gain_db", "bus")]
         if kept_on:
             entry["kept_on_in_off"] = kept_on
+        progress(f"off {len(records) + 1}/{len(measured)}")
         if not record.get("steps") and len(kept_on) == len(record.get("fields", [])):
             entry["off"] = {"skipped": "claims only gain_db or bus, which have no off state"}
         else:
