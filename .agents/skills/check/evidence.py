@@ -69,7 +69,35 @@ def fingerprint(*parts):
         if isinstance(value, (list, tuple)):
             return [plain(v) for v in value]
         return value
-    return hashlib.sha256(json.dumps(plain(list(parts)), sort_keys=True).encode()).hexdigest()
+    # Dict order is kept: render sums stems, orders buses and applies settings in recipe order.
+    return hashlib.sha256(json.dumps(plain(list(parts))).encode()).hexdigest()
+
+
+TEXT = {"note", "reason", "review", "tool_reason", "chain_reason", "split_reason", "role_reason"}
+
+
+def untext(entry):
+    return {key: value for key, value in entry.items() if key not in TEXT}
+
+
+def numeric(recipe):
+    """The recipe as renders and readings see it: no moves, notes, reviews or reasons."""
+    out = {key: value for key, value in recipe.items() if key not in ("moves", "notes", "reviews")}
+    if "steps" in out:
+        out["steps"] = [untext(step) for step in out["steps"]]
+    if "sources" in out:
+        out["sources"] = {name: untext(source) for name, source in out["sources"].items()}
+    return out
+
+
+def record_part(record):
+    """A record as its contract reads it. An override's presence and leaves decide the outcome, its reason does not."""
+    out = untext(record)
+    if isinstance(out.get("override"), dict):
+        out["override"] = dict(out["override"], reason="reason" in out["override"])
+    if isinstance(out.get("trial"), dict) and "steps" in out["trial"]:
+        out["trial"] = dict(out["trial"], steps=[untext(step) for step in out["trial"]["steps"]])
+    return out
 
 
 def off_variant(recipe, record):
@@ -283,7 +311,7 @@ class Variants:
 
     def battery_path(self, key):
         points, chain_times, chain_nodes = self.layout
-        return self.cache / f"{fingerprint(self.recipes[key], self.target, self.boundary, self.outside, points, chain_times, chain_nodes)}.json"
+        return self.cache / f"{fingerprint(numeric(self.recipes[key]), self.target, self.boundary, self.outside, points, chain_times, chain_nodes)}.json"
 
     def battery(self, key):
         if key not in self.batteries:
@@ -566,7 +594,7 @@ def off_key(recipe, record):
 def recipe_key(variant):
     # Keyed by the recipe itself: a step id may equal another record's field path, and two roles (no-send and
     # no-delay) may need the very same render.
-    return f"recipe:{fingerprint(variant)}"
+    return f"recipe:{fingerprint(numeric(variant))}"
 
 
 def contract_report(recipe, song, nodes, variants, ctx, master_mode):
@@ -574,6 +602,7 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
     records = [r for r in recipe.get("moves", []) if r.get("move") != "balance"
                and (master_mode or not str(r.get("move")).startswith("master."))]
     fact = facts(recipe, routing, ctx, records)
+    active = sorted({json.dumps([r.get("move"), r.get("decision")]) for r in records})
     steps = {step.get("id"): step for step in recipe.get("steps", [])}
     entries = []
     for record in records:
@@ -613,9 +642,14 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
     # Records that share a variant run together, so each render is made once and dropped once.
     for entry in sorted(entries, key=lambda e: str(e["keys"].get("without", "")) + str(e["keys"].get("with", ""))):
         record, keys = entry["record"], entry["keys"]
-        path = variants.cache / f"contract-{fingerprint(record, entry['contract'], {r: variants.recipes[k] for r, k in keys.items()}, variants.outside, ctx.times, ctx.target, master_mode)}.json"
+        variant_parts = {role: numeric(variants.recipes[key]) for role, key in keys.items()}
+        # Taps come from every record, and a reading of an untapped name is None, so they are part of every key.
+        key = fingerprint(record_part(record), entry["contract"], variant_parts, numeric(recipe), active,
+                          sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
+        path = variants.cache / f"contract-{key}.json"
         if path.exists():
-            out.append(json.loads(path.read_text()))
+            # The key leaves out text, so text comes from the current record, never the cache.
+            out.append(json.loads(path.read_text()) | {"override": record.get("override")})
             continue
         compare = entry["contract"].get("compare")
         if compare == "alt" and "with" in keys:
