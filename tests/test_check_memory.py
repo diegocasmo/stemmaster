@@ -134,6 +134,7 @@ def test_taps_on_disk_give_the_same_report_bytes_as_taps_in_memory(tmp_path, mon
     real = spill.Taps._spill
     monkeypatch.setattr(spill.Taps, "_spill", lambda self, name: written.append(name) or real(self, name))
     monkeypatch.setattr(spill, "RESIDENT", 0)
+    monkeypatch.setattr(workers, "free_fraction", lambda: 0.9)
     monkeypatch.setenv(workers.BUDGET_ENV, "0")
     spilled = report_bytes(disk, recipe, master_mode, monkeypatch, tmp_path / "memo-disk")
     assert written
@@ -166,14 +167,33 @@ def test_taps_stay_in_memory_while_they_fit_the_budget(monkeypatch):
     assert set(taps.resident) == {"b", "c", "d"} and set(taps.spilled) == {"a"}
 
 
-@pytest.mark.parametrize("free, n, expected_gb", [(0.7, 3, 0.5 * (0.4 * 16 / 3 - 2)), (0.7, 1, 0.5 * (0.4 * 16 - 2)),
-                                                    (0.35, 1, 0), (None, 1, 0)])
-def test_the_budget_is_half_of_what_the_share_above_the_floor_leaves(monkeypatch, free, n, expected_gb):
+@pytest.mark.parametrize("free, n, keep, share, expected_gb", [
+    (0.7, 3, 0, 0.5, 0.5 * (0.4 * 16 / 3 - 2)), (0.7, 1, 0, 1, 0.4 * 16 - 2), (0.9, 2, 1, 0.5, 1 + 0.5 * (0.6 * 16 / 2 - 2)),
+    (0.35, 1, 0, 1, 0), (0.35, 1, 1, 0.5, 1), (None, 1, 1, 0.5, 1)])
+def test_the_budget_is_what_a_worker_keeps_plus_a_share_of_what_memory_leaves(monkeypatch, free, n, keep, share, expected_gb):
     monkeypatch.delenv(workers.BUDGET_ENV, raising=False)
     monkeypatch.setattr(workers, "free_fraction", lambda: free)
     GB = 1 << 30
 
-    assert workers.budget(2 * GB, n, total=16 * GB) == pytest.approx(expected_gb * GB, abs=1)
+    assert workers.budget(2 * GB, n, keep * GB, share, total=16 * GB) == pytest.approx(expected_gb * GB, abs=1)
+
+
+def test_taps_go_to_disk_when_free_memory_runs_short_whatever_the_budget(monkeypatch):
+    free = [0.9]
+    monkeypatch.setattr(spill, "RESIDENT", 1)
+    monkeypatch.setattr(spill, "BUDGET", 10**9)
+    monkeypatch.setattr(spill, "FREE", lambda: free[0])
+    monkeypatch.setattr(spill, "FLOOR", 0.35)
+    monkeypatch.setattr(spill, "_FREE_READ", [-1.0, False])
+    taps = spill.Taps()
+    taps["a"] = np.zeros((10, 2))
+    taps["b"] = np.zeros((10, 2))
+    assert not taps.spilled
+    free[0] = 0.32
+    spill._FREE_READ[0] = -1.0
+    taps["c"] = np.zeros((10, 2))
+
+    assert set(taps.spilled) == {"a", "b"} and set(taps.resident) == {"c"}
 
 
 def test_a_checks_peak_grows_by_few_signals_per_second_of_song(tmp_path, monkeypatch):

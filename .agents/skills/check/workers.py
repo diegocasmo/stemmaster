@@ -26,10 +26,17 @@ POLL_S = 1.0
 BASE_BYTES = 600 << 20
 TAP_SIGNALS = 1.0
 PEAKS = "workers.json"
-# A process keeps taps in memory up to this share of what its part of the memory above the floor leaves over its
-# estimate; the rest is margin, so workers filling their budgets don't push free memory onto the floor.
+# Taps a worker keeps in memory on top of TAP_SIGNALS, so it writes next to nothing to disk: together 2.5 per tap,
+# which covered song 000's 2.28 when every tap was held. Spill writes wear the SSD, so the worker count makes room for
+# them unless STEMMASTER_SPILL_WORKERS=1 trades them for more workers.
+HOLD_SIGNALS = 1.5
+SPILL_ENV = "STEMMASTER_SPILL_WORKERS"
+# Workers get half of what their share of the memory above the floor leaves over their need, as more taps to keep;
+# the rest is margin, so workers filling their budgets don't push free memory onto the floor.
 BUDGET_SHARE = 0.5
 BUDGET_ENV = "STEMMASTER_SPILL_BUDGET_MB"
+# Under this much free memory any process sends its taps to disk, before the workers' monitor stops them at the floor.
+SPILL_FLOOR = FREE_FLOOR + 0.05
 # Named for the code that measured it: a peak measured while every tap was held says nothing about this code's.
 FACTOR = "per_tapped_signal_spilled"
 _STATE = {}
@@ -77,8 +84,14 @@ def sizes(recipe, variants, ctx):
     return ctx.length * 2 * 8, taps
 
 
-def budget(need, n, free=None, total=None):
-    """Bytes of taps each of n processes keeps in memory before spilling to disk; 0 if free memory is unknown."""
+def hold(signal_bytes, taps):
+    """Bytes of taps a worker keeps in memory on top of its estimate: none when workers may spill."""
+    return 0 if os.environ.get(SPILL_ENV) == "1" else HOLD_SIGNALS * signal_bytes * taps
+
+
+def budget(need, n, keep=0, share=BUDGET_SHARE, free=None, total=None):
+    """Bytes of taps each of n processes keeps in memory before spilling: `keep`, plus `share` of what its part of the
+    memory above the floor leaves over `need`; only `keep` if free memory is unknown."""
     override = os.environ.get(BUDGET_ENV)
     if override is not None:
         try:
@@ -87,9 +100,9 @@ def budget(need, n, free=None, total=None):
             sys.exit(f"{BUDGET_ENV} must be a whole number of MB (0 keeps only a few taps in memory), not {override!r}")
     free = free_fraction() if free is None else free
     if free is None:
-        return 0
+        return int(keep)
     spare = (free - FREE_FLOOR) * (total or total_bytes())
-    return max(0, int(BUDGET_SHARE * (spare / n - need)))
+    return int(keep + max(0, share * (spare / n - need)))
 
 
 def record(cache, signal_bytes, taps, peaks, held=0):
@@ -149,12 +162,13 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     if len(todo) < 2:
         return
     signal_bytes, taps = sizes(recipe, variants, ctx)
-    need = estimate(variants.cache, signal_bytes, taps)
-    n = count(len(todo), need)
+    work, keep = estimate(variants.cache, signal_bytes, taps), hold(signal_bytes, taps)
+    n = count(len(todo), work + keep)
     if n < 2:
         return
-    held = budget(need, n)
-    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB "
+    held = budget(work + keep, n, keep)
+    need = work + held
+    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(work) >> 20} MB "
                       f"plus {held >> 20} MB of taps kept in memory")
     peaks, pool = [], None
     # The machinery is best effort: whatever goes wrong here, the check computes every missing part itself.
@@ -168,7 +182,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
             if free is None or free < FREE_FLOOR:
                 evidence.progress("workers stopped: free memory " + ("unknown" if free is None else f"{free:.0%} is under {FREE_FLOOR:.0%}"))
                 return
-            if waiting and len(running) < n and (not running or (free - FREE_FLOOR) * total_bytes() >= need + held):
+            if waiting and len(running) < n and (not running or (free - FREE_FLOOR) * total_bytes() >= need):
                 contracts, published = waiting.pop(0)
                 future = pool.submit(_run, contracts, published)
                 running.add(future)
@@ -205,7 +219,7 @@ def _start(recipe, song, nodes, master_mode, planned, outside, held):
     import evidence
     import spill
 
-    spill.BUDGET = held
+    spill.BUDGET, spill.FREE, spill.FLOOR = held, free_fraction, SPILL_FLOOR
 
     # Only the check prints its report, fails and progress; a worker's error reaches it through its part's result.
     devnull = os.open(os.devnull, os.O_WRONLY)

@@ -232,13 +232,23 @@ def test_a_small_songs_peak_keeps_the_estimate_scaling_with_length(tmp_path, mon
 SONG_SIGNAL, SONG_TAPS = round(90.457 * 44100) * 16, 26
 
 
-@pytest.mark.parametrize("free, expected", [(1.0, 5), (0.9, 4), (0.7, 3), (0.65, 2), (0.4, 1)])
-def test_a_90_s_song_on_16_gb_gets_three_workers_at_70_percent_free(tmp_path, monkeypatch, free, expected):
+@pytest.mark.parametrize("spill, free, expected", [
+    (None, 1.0, 2), (None, 0.87, 2), (None, 0.7, 1),
+    ("1", 1.0, 5), ("1", 0.87, 4), ("1", 0.7, 3), ("1", 0.65, 2), ("1", 0.4, 1),
+], ids=lambda value: f"{value}")
+def test_a_90_s_song_on_16_gb_gets_workers_that_keep_their_taps_unless_they_may_spill(tmp_path, monkeypatch, spill, free,
+                                                                                      expected):
     monkeypatch.delenv(workers.ENV)
-    need = workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS)
+    if spill is None:
+        monkeypatch.delenv(workers.SPILL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(workers.SPILL_ENV, spill)
+    work = workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS)
+    keep = workers.hold(SONG_SIGNAL, SONG_TAPS)
 
-    assert need > 1.8e9
-    assert workers.count(20, need, free=free, total=16 * GB, cpus=8) == expected
+    assert work > 1.8e9
+    assert keep == (0 if spill else 1.5 * SONG_SIGNAL * SONG_TAPS)
+    assert workers.count(20, work + keep, free=free, total=16 * GB, cpus=8) == expected
 
 
 def test_a_peak_measured_with_every_tap_held_is_not_read(tmp_path):

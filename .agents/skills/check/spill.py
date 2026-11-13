@@ -3,6 +3,7 @@ import collections
 import itertools
 import os
 import tempfile
+import time
 import weakref
 
 import numpy as np
@@ -11,6 +12,10 @@ import numpy as np
 # the least recently used go to disk. The check sets the budget from free memory; 0 keeps only RESIDENT taps.
 RESIDENT = 4
 BUDGET = 0
+# The safety net, set by the check: free memory as a fraction (None if unknown), read at most once a second. Under
+# FLOOR, or unknown, taps go to disk whatever the budget, so a run that free memory shrinks under keeps going.
+FREE, FLOOR = None, 0.0
+_FREE_READ = [-1.0, False]
 _LRU = collections.OrderedDict()
 _HELD = [0]
 _SERIAL = itertools.count()
@@ -23,12 +28,22 @@ def _touch(store, name, nbytes):
     _LRU[key] = weakref.ref(store), nbytes
     _HELD[0] += nbytes
     _LRU.move_to_end(key)
-    while len(_LRU) > RESIDENT and _HELD[0] > BUDGET:
+    limit = 0 if _short() else BUDGET
+    while len(_LRU) > RESIDENT and _HELD[0] > limit:
         (_, old), (ref, size) = _LRU.popitem(last=False)
         _HELD[0] -= size
         owner = ref()
         if owner is not None:
             owner._spill(old)
+
+
+def _short():
+    if FREE is None:
+        return False
+    if time.monotonic() - _FREE_READ[0] >= 1:
+        free = FREE()
+        _FREE_READ[:] = [time.monotonic(), free is None or free < FLOOR]
+    return _FREE_READ[1]
 
 
 def _forget(serial):
