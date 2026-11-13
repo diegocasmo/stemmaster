@@ -17,6 +17,7 @@ import render
 from analyze import bands_db, measure as analyze_file, stereo
 import hits as hit_tools
 import measure
+from memo import memoized
 
 import contracts
 import outcomes as outcome_tools
@@ -37,7 +38,7 @@ OWN_HIT_DB = 6
 OWN_GROUP_MIN = 3
 CODE = [ROOT / ".agents" / "skills" / path for path in (
     "render/render.py", "render/native.py", "render/airwindows.py",
-    "analyze/analyze.py", "analyze/hits.py", "analyze/measure.py", "analyze/notes.py", "align/align.py",
+    "analyze/analyze.py", "analyze/hits.py", "analyze/measure.py", "analyze/memo.py", "analyze/notes.py", "align/align.py",
     "check/evidence.py", "check/structure.py", "check/chains.py", "check/contracts.py", "check/outcomes.py",
 )]
 
@@ -185,6 +186,7 @@ def matched_master(result, target):
             "matched": bool(np.isfinite(error) and abs(error) <= MATCH_LU)}, master_in, out
 
 
+@memoized
 def observe(audio, rate, hits, sections):
     level = loudness(audio, rate)
     entry = {"integrated_lufs": measure.rounded(level), "bands_db": bands_db([audio], rate)["bands_db"],
