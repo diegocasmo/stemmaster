@@ -16,7 +16,8 @@ def peak_mb(who):
 
 def log_path(recipe_path):
     """The song's log; a cut made by check/cut.py logs into the song it was cut from."""
-    song = Path(recipe_path).resolve().parent
+    # The supplied path's folder, not a symlinked recipe's: a cut may link the song's recipe yet render its own stems.
+    song = Path(recipe_path).parent.resolve()
     if song.parent.name == "cuts" and song.parent.parent.name == "renders":
         return song.parent.parent / "timings.jsonl", song.name
     return song / "renders" / "timings.jsonl", None

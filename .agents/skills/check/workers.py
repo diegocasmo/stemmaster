@@ -25,6 +25,8 @@ POLL_S = 1.0
 BASE_BYTES = 600 << 20
 TAP_SIGNALS = 2.5
 PEAKS = "workers.json"
+# Variant renders done in workers, which the run log adds to the check's own.
+RENDERS = [0]
 _STATE = {}
 
 
@@ -148,8 +150,9 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                     # The check meets the same error itself, in its own order, when it computes this part.
                     evidence.progress(f"workers stopped: {type(future.exception()).__name__}: {future.exception()}")
                     return
-                peak, seconds = future.result()
+                peak, seconds, renders = future.result()
                 peaks.append(peak)
+                RENDERS[0] += renders
                 done += 1
                 evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future]}... {seconds:.0f} s), worker peak {peak >> 20} MB")
                 if waiting:
@@ -202,4 +205,6 @@ def _run(contracts, published):
     # Only the current render is shared between parts; the rest would hold memory the next part needs.
     for key in [k for k in variants.views if k != "current"]:
         variants.drop(key)
-    return peak_bytes(), time.monotonic() - started
+    # Since this worker's last part, so the renders _start did count once.
+    renders, state["counted"] = evidence.RENDERS[0] - state.get("counted", 0), evidence.RENDERS[0]
+    return peak_bytes(), time.monotonic() - started, renders

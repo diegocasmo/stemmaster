@@ -42,3 +42,41 @@ def test_a_cut_logs_into_its_song(tmp_path):
         sys.exit(2)
 
     assert [(line["cut"], line["exit"]) for line in lines(tmp_path / "renders" / "timings.jsonl")] == [("b-c", 2)]
+
+
+def test_a_check_counts_the_renders_its_workers_did(tmp_path, monkeypatch):
+    import check
+    import evidence
+    import structure
+    import workers
+
+    song = tmp_path / "song"
+    (song / "stems").mkdir(parents=True)
+    write(song, "Bass.wav", noise(1))
+    recipe = {"stems": {"Bass.wav": {}}, "sources": {"bass": {"chain": "bass", "stems": ["Bass.wav"]}},
+              "steps": [{"id": "hpf", "target": "Bass.wav", "plugin": "HighpassFilter", "settings": {"cutoff_frequency_hz": 40}}],
+              "moves": [{"move": "bass.hpf", "source": "bass", "decision": "kept", "steps": ["hpf"]},
+                        {"move": "bass.mud-cut", "source": "bass", "decision": "dropped"}]}
+    (song / "recipe.json").write_text(json.dumps(recipe))
+    monkeypatch.setenv(workers.ENV, "2")
+    monkeypatch.setenv("STEMMASTER_NODE_MEMO_DIR", str(tmp_path / "memo"))
+    monkeypatch.setattr(workers, "free_fraction", lambda: 0.9)
+    monkeypatch.setattr(evidence, "RENDERS", [0])
+    monkeypatch.setattr(workers, "RENDERS", [0])
+    real = workers.futures.ProcessPoolExecutor
+    # One worker process, so the test stays small.
+    monkeypatch.setattr(workers.futures, "ProcessPoolExecutor", lambda *a, **k: real(1, **k))
+
+    evidence.report(recipe, song, structure.nodes(recipe, structure.Routing(recipe), []))
+
+    assert workers.RENDERS[0] > 0
+    assert check.details(song / "recipe.json", [], set())["counts"]["variant_renders"] == evidence.RENDERS[0] + workers.RENDERS[0]
+
+
+def test_a_cut_linking_the_songs_recipe_logs_as_the_cut(tmp_path):
+    (tmp_path / "recipe.json").write_text("{}")
+    cut = tmp_path / "renders" / "cuts" / "phrase"
+    (cut / "stems").mkdir(parents=True)
+    (cut / "recipe.json").symlink_to(tmp_path / "recipe.json")
+
+    assert runlog.log_path(cut / "recipe.json") == (tmp_path.resolve() / "renders" / "timings.jsonl", "phrase")
