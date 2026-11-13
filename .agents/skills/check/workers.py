@@ -20,9 +20,10 @@ ENV = "STEMMASTER_CHECK_WORKERS"
 # Kept free for the rest of the machine while workers run.
 FREE_FLOOR = 0.30
 POLL_S = 1.0
-# A worker's peak is its interpreter and plugins plus a few renders, each holding every tap at full length.
+# A worker's peak is its interpreter and plugins plus a few renders, each holding every tap at full length. Song 000's
+# 90 s cut measured 2.28 tapped signals per worker; the default keeps a margin over that.
 BASE_BYTES = 600 << 20
-TAP_SIGNALS = 8
+TAP_SIGNALS = 2.5
 PEAKS = "workers.json"
 _STATE = {}
 
@@ -35,7 +36,7 @@ def free_fraction():
     """The system's free memory as a fraction of all of it, as macOS memory_pressure reports it; None if unknown."""
     try:
         if sys.platform == "darwin":
-            out = subprocess.run(["/usr/bin/memory_pressure", "-Q"], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run(["/usr/bin/memory_pressure", "-Q"], capture_output=True, text=True, timeout=2).stdout
             return int(re.search(r"free percentage: (\d+)%", out)[1]) / 100
         with open("/proc/meminfo") as file:
             info = dict(line.split(":", 1) for line in file)
@@ -49,25 +50,28 @@ def peak_bytes():
     return peak if sys.platform == "darwin" else peak * 1024
 
 
-def estimate(cache, signal_bytes, taps):
-    """A worker's peak memory: from this song's largest measured worker peak, else from the model."""
-    per_signal = TAP_SIGNALS
+def recorded(cache):
     try:
-        per_signal = float(json.loads((cache / PEAKS).read_text())["per_tapped_signal"])
+        return float(json.loads((cache / PEAKS).read_text())["per_tapped_signal"])
     except Exception:
-        pass
-    return BASE_BYTES + per_signal * signal_bytes * taps
+        return 0.0
+
+
+def estimate(cache, signal_bytes, taps):
+    """A worker's peak memory. A measured peak only raises the default: a small song's peak says little about a long one."""
+    return BASE_BYTES + max(TAP_SIGNALS, recorded(cache)) * signal_bytes * taps
 
 
 def record(cache, signal_bytes, taps, peaks):
-    if not peaks or not signal_bytes * taps:
-        return
-    per_signal = max(0.0, (max(peaks) - BASE_BYTES) / (signal_bytes * taps))
+    """Keeps this song's largest worker peak per tapped signal. Bookkeeping only: it never fails the check."""
+    import evidence
+
     try:
-        per_signal = max(per_signal, float(json.loads((cache / PEAKS).read_text())["per_tapped_signal"]))
-    except Exception:
-        pass
-    (cache / PEAKS).write_text(json.dumps({"per_tapped_signal": per_signal, "peak_bytes": max(peaks)}))
+        if peaks and signal_bytes * taps:
+            per_signal = max(recorded(cache), (max(peaks) - BASE_BYTES) / (signal_bytes * taps))
+            evidence.write_atomic(cache / PEAKS, json.dumps({"per_tapped_signal": per_signal, "peak_bytes": max(peaks)}))
+    except Exception as error:
+        evidence.progress(f"workers: peak not recorded: {error}")
 
 
 def count(parts, need, free=None, total=None, cpus=None):
@@ -111,6 +115,9 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     import evidence
     import render
 
+    for temp in variants.cache.glob("*.tmp"):
+        # Left by a killed worker or check; nothing reads them.
+        temp.unlink(missing_ok=True)
     todo = parts(recipe, variants, ctx, master_mode)
     if len(todo) < 2:
         return
@@ -120,15 +127,25 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     n = count(len(todo), need)
     if n < 2:
         return
-    evidence.progress(f"{n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB")
-    peaks, done = [], 0
-    pool = futures.ProcessPoolExecutor(n, mp_context=multiprocessing.get_context("spawn"), initializer=_start,
-                                       initargs=(recipe, song, nodes, master_mode, planned, outside))
+    evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB")
+    peaks, pool = [], None
+    # The machinery is best effort: whatever goes wrong here, the check computes every missing part itself.
     try:
-        pending = {pool.submit(_run, contracts, published): contracts or published for contracts, published in todo}
-        names = dict(pending)
-        while pending:
-            finished, pending = futures.wait(pending, timeout=POLL_S, return_when=futures.FIRST_COMPLETED)
+        pool = futures.ProcessPoolExecutor(n, mp_context=multiprocessing.get_context("spawn"), initializer=_start,
+                                           initargs=(recipe, song, nodes, master_mode, planned, outside))
+        waiting, running, names, done = list(todo), set(), {}, 0
+        while waiting or running:
+            # One more worker per poll, and only while free memory has room for it, so starting them is no burst.
+            free = free_fraction()
+            if free is None or free < FREE_FLOOR:
+                evidence.progress("workers stopped: free memory " + ("unknown" if free is None else f"{free:.0%} is under {FREE_FLOOR:.0%}"))
+                return
+            if waiting and len(running) < n and (not running or (free - FREE_FLOOR) * total_bytes() >= need):
+                contracts, published = waiting.pop(0)
+                future = pool.submit(_run, contracts, published)
+                running.add(future)
+                names[future] = (contracts or published)[0]
+            finished, running = futures.wait(running, timeout=POLL_S, return_when=futures.FIRST_COMPLETED)
             for future in finished:
                 if future.exception() is not None:
                     # The check meets the same error itself, in its own order, when it computes this part.
@@ -137,23 +154,38 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                 peak, seconds = future.result()
                 peaks.append(peak)
                 done += 1
-                evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future][0]}... {seconds:.0f} s), "
-                                  f"worker peak {peak >> 20} MB")
-            if (free := free_fraction()) is not None and free < FREE_FLOOR:
-                evidence.progress(f"workers stopped: free memory {free:.0%} is under {FREE_FLOOR:.0%}")
-                return
+                evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future]}... {seconds:.0f} s), worker peak {peak >> 20} MB")
+                if waiting:
+                    # A finished part frees its worker for the next one at once.
+                    contracts, published = waiting.pop(0)
+                    future = pool.submit(_run, contracts, published)
+                    running.add(future)
+                    names[future] = (contracts or published)[0]
+    except Exception as error:
+        evidence.progress(f"workers stopped: {type(error).__name__}: {error}")
     finally:
-        pool.kill_workers()
-        pool.shutdown(wait=True, cancel_futures=True)
+        if pool is not None:
+            try:
+                pool.kill_workers()
+                pool.shutdown(wait=True, cancel_futures=True)
+            except Exception as error:
+                evidence.progress(f"workers: shutdown failed: {error}")
         record(variants.cache, signal_bytes, taps, peaks)
 
 
 def _start(recipe, song, nodes, master_mode, planned, outside):
     import evidence
 
-    # Only the check prints its report and fails; a worker's progress would interleave with the others'.
-    sys.stdout = open(os.devnull, "w")
+    # Only the check prints its report, fails and progress; a worker's error reaches it through its part's result.
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
     evidence.progress = lambda message: None
+    # A stem, plugin, doc or code file changed since the check hashed them would be cached under the wrong key, so
+    # such a worker refuses every part, and the refusal reaches the check as the part's error.
+    if evidence.inputs(song, recipe) != outside:
+        _STATE["refused"] = "the song's stems, plugins, docs or check code changed after the check hashed them"
+        return
     variants, ctx, _ = evidence.prepare(recipe, song, nodes, planned, outside)
     evidence.contract_entries(recipe, variants, ctx, master_mode)
     _STATE.update(recipe=recipe, song=song, nodes=nodes, master_mode=master_mode, variants=variants, ctx=ctx)
@@ -163,6 +195,8 @@ def _run(contracts, published):
     import evidence
 
     state, started = _STATE, time.monotonic()
+    if "refused" in state:
+        raise RuntimeError(state["refused"])
     variants = state["variants"]
     evidence.contract_report(state["recipe"], state["song"], state["nodes"], variants, state["ctx"], state["master_mode"],
                              only={tuple(c) for c in contracts})

@@ -132,9 +132,21 @@ def test_a_killed_worker_leaves_the_check_to_finish_the_rest(tmp_path, monkeypat
     recipe = band(one, 2)
     shutil.copytree(one / "stems", two / "stems")
     alone = check(one, recipe, False, 1, monkeypatch, tmp_path / "memo-one")
-    monkeypatch.setattr(workers, "free_fraction", lambda: 0.1)
+    samples = iter([0.9, 0.9, 0.9])
+    monkeypatch.setattr(workers, "free_fraction", lambda: next(samples, 0.1))
 
     assert check(two, recipe, False, 2, monkeypatch, tmp_path / "memo-two") == alone
+
+
+@pytest.mark.parametrize("free", [None, 0.1], ids=["unknown", "under-floor"])
+def test_workers_never_start_without_room(tmp_path, monkeypatch, free):
+    recipe = band(tmp_path, 2)
+    monkeypatch.setattr(workers, "free_fraction", lambda: free)
+    pool = NoSubmit()
+    monkeypatch.setattr(workers.futures, "ProcessPoolExecutor", lambda *args, **kwargs: pool)
+    monkeypatch.setattr(pool, "submit", lambda *args: pytest.fail("a worker started"))
+
+    check(tmp_path, recipe, False, 2, monkeypatch, tmp_path / "memo")
 
 
 def test_a_warm_check_starts_no_workers(tmp_path, monkeypatch):
@@ -188,12 +200,130 @@ def test_a_bad_env_value_stops_the_check(monkeypatch):
         workers.count(20, GB, free=0.9, total=16 * GB, cpus=8)
 
 
-def test_the_estimate_uses_the_largest_measured_peak(tmp_path):
+def test_a_measured_peak_only_raises_the_estimate(tmp_path):
     signal, taps = 10 << 20, 20
     model = workers.estimate(tmp_path, signal, taps)
-    workers.record(tmp_path, signal, taps, [workers.BASE_BYTES + 2 * signal * taps])
+    workers.record(tmp_path, signal, taps, [workers.BASE_BYTES + 4 * signal * taps])
     measured = workers.estimate(tmp_path, signal, taps)
     workers.record(tmp_path, signal, taps, [workers.BASE_BYTES + signal * taps])
 
     assert model == workers.BASE_BYTES + workers.TAP_SIGNALS * signal * taps
-    assert measured == workers.estimate(tmp_path, signal, taps) == workers.BASE_BYTES + 2 * signal * taps
+    assert measured == workers.estimate(tmp_path, signal, taps) == workers.BASE_BYTES + 4 * signal * taps
+
+
+def test_a_small_songs_peak_keeps_the_estimate_scaling_with_length(tmp_path, monkeypatch):
+    monkeypatch.delenv(workers.ENV)
+    signal, taps = round(90 * 44100) * 16, 40
+    before = workers.estimate(tmp_path, signal, taps)
+    workers.record(tmp_path, 44100 * 16, 1, [172 << 20])
+
+    assert workers.estimate(tmp_path, signal, taps) == before
+    assert workers.count(20, before, free=0.8, total=16 * GB, cpus=8) == 1
+
+
+# Song 000's 90 s cut: 26 tapped signals of 63.8 MB, a measured worker peak of 4.41 GB.
+SONG_SIGNAL, SONG_TAPS = round(90.457 * 44100) * 16, 26
+
+
+@pytest.mark.parametrize("free, expected", [(0.9, 2), (1.0, 2), (0.8, 1)])
+def test_a_90_s_song_on_16_gb_gets_two_workers_when_they_fit(tmp_path, monkeypatch, free, expected):
+    monkeypatch.delenv(workers.ENV)
+    need = workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS)
+
+    assert need > 4414734336
+    assert workers.count(20, need, free=free, total=16 * GB, cpus=8) == expected
+
+
+def test_a_peak_that_cant_be_written_never_fails_the_check(tmp_path):
+    (tmp_path / workers.PEAKS).mkdir()
+
+    workers.record(tmp_path, 10 << 20, 20, [1 << 30])
+
+
+def one_bass(song):
+    (song / "stems").mkdir(parents=True)
+    soundfile.write(song / "stems" / "Bass.wav", noise(1, 11), RATE, subtype="FLOAT")
+    return {"stems": {"Bass.wav": {}}, "sources": {"bass": {"chain": "bass", "stems": ["Bass.wav"]}},
+            "steps": [step("hpf", "Bass.wav", "HighpassFilter", cutoff_frequency_hz=40)],
+            "moves": [{"move": "bass.hpf", "source": "bass", "decision": "kept", "steps": ["hpf"]},
+                      {"move": "bass.mud-cut", "source": "bass", "decision": "dropped"}]}
+
+
+class NoSubmit:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def submit(self, *args, **kwargs):
+        raise OSError(11, "Resource temporarily unavailable")
+
+    def kill_workers(self):
+        pass
+
+    def shutdown(self, **kwargs):
+        pass
+
+
+def no_pool(*args, **kwargs):
+    raise OSError(24, "Too many open files")
+
+
+def read_only_peaks(cache):
+    cache.mkdir(parents=True)
+    (cache / workers.PEAKS).write_text(json.dumps({"per_tapped_signal": 8, "peak_bytes": 400 << 20}))
+    (cache / workers.PEAKS).chmod(0o444)
+
+
+@pytest.mark.parametrize("break_it", ["constructor", "submit", "record"])
+def test_a_broken_pool_or_peak_file_leaves_the_check_to_one_process(tmp_path, monkeypatch, break_it):
+    one, two = tmp_path / "one", tmp_path / "two"
+    recipe = one_bass(one)
+    shutil.copytree(one / "stems", two / "stems")
+    alone = check(one, recipe, False, 1, monkeypatch, tmp_path / "memo-one")
+    monkeypatch.setattr(workers, "free_fraction", lambda: 0.9)
+    if break_it == "constructor":
+        monkeypatch.setattr(workers.futures, "ProcessPoolExecutor", no_pool)
+    elif break_it == "submit":
+        monkeypatch.setattr(workers.futures, "ProcessPoolExecutor", NoSubmit)
+    else:
+        read_only_peaks(two / "renders" / "check")
+
+    assert check(two, recipe, False, 2, monkeypatch, tmp_path / "memo-two") == alone
+
+
+def test_workers_refuse_a_stem_changed_after_the_check_hashed_it(tmp_path, monkeypatch):
+    song = tmp_path / "song"
+    recipe = one_bass(song)
+    alone = check(song, recipe, False, 1, monkeypatch, tmp_path / "memo-one")
+    shutil.rmtree(song / "renders")
+    stem = song / "stems" / "Bass.wav"
+    original = stem.read_bytes()
+    audio, rate = soundfile.read(stem)
+    pool, record = workers.futures.ProcessPoolExecutor, workers.record
+
+    def edit_before_workers(*args, **kwargs):
+        soundfile.write(stem, audio * 0.25, rate, subtype="FLOAT")
+        return pool(*args, **kwargs)
+
+    def restore_after_workers(*args, **kwargs):
+        stem.write_bytes(original)
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr(workers.futures, "ProcessPoolExecutor", edit_before_workers)
+    monkeypatch.setattr(workers, "record", restore_after_workers)
+    monkeypatch.setattr(workers, "free_fraction", lambda: 0.9)
+
+    assert check(song, recipe, False, 2, monkeypatch, tmp_path / "memo-two") == alone
+
+
+def test_cold_warm_and_partly_cached_checks_with_workers_match_one_process(tmp_path, monkeypatch):
+    recipe = one_bass(tmp_path)
+    monkeypatch.setattr(workers, "free_fraction", lambda: 0.9)
+    alone = check(tmp_path, recipe, False, 1, monkeypatch, tmp_path / "memo-one")
+    cache = tmp_path / "renders" / "check"
+    shutil.rmtree(cache)
+
+    assert check(tmp_path, recipe, False, 2, monkeypatch, tmp_path / "memo") == alone
+    assert check(tmp_path, recipe, False, 2, monkeypatch, tmp_path / "memo") == alone
+    for pattern in ("contract-*.json", "[0-9a-f]*.json"):
+        next(cache.glob(pattern)).unlink()
+        assert check(tmp_path, recipe, False, 2, monkeypatch, tmp_path / "memo") == alone
