@@ -127,12 +127,12 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     if n < 2:
         return
     evidence.progress(f"up to {n} workers for {len(todo)} parts, each estimated at {int(need) >> 20} MB")
-    peaks, pool = [], None
+    peaks, pool, names = [], None, {}
     # The machinery is best effort: whatever goes wrong here, the check computes every missing part itself.
     try:
         pool = futures.ProcessPoolExecutor(n, mp_context=multiprocessing.get_context("spawn"), initializer=_start,
                                            initargs=(recipe, song, nodes, master_mode, planned, outside))
-        waiting, running, names, done = list(todo), set(), {}, 0
+        waiting, running, done = list(todo), set(), 0
         while waiting or running:
             # One more worker per poll, and only while free memory has room for it, so starting them is no burst.
             free = free_fraction()
@@ -147,13 +147,11 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
             finished, running = futures.wait(running, timeout=POLL_S, return_when=futures.FIRST_COMPLETED)
             for future in finished:
                 if future.exception() is not None:
-                    RENDERS[0] += getattr(future.exception(), "worker_renders", 0)
                     # The check meets the same error itself, in its own order, when it computes this part.
                     evidence.progress(f"workers stopped: {type(future.exception()).__name__}: {future.exception()}")
                     return
-                peak, seconds, renders = future.result()
+                peak, seconds, _ = future.result()
                 peaks.append(peak)
-                RENDERS[0] += renders
                 done += 1
                 evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future]}... {seconds:.0f} s), worker peak {peak >> 20} MB")
                 if waiting:
@@ -165,6 +163,11 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     except Exception as error:
         evidence.progress(f"workers stopped: {type(error).__name__}: {error}")
     finally:
+        # Every part that finished, including those an early stop never read, so the run log counts their renders.
+        for future in names:
+            if future.done() and not future.cancelled():
+                error = future.exception()
+                RENDERS[0] += getattr(error, "worker_renders", 0) if error is not None else future.result()[2]
         if pool is not None:
             try:
                 pool.kill_workers()

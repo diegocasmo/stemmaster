@@ -104,7 +104,7 @@ def details(recipe_path, flags, before):
     added = cache_files(recipe_path) - before
     try:
         moves = len(json.loads(Path(recipe_path).read_text()).get("moves", []))
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, TypeError):
         moves = None
     return {"scope": {"flags": flags, "moves": moves},
             "counts": {"contracts": RUN.get("contracts"), "contracts_cold": sum(n.startswith("contract-") for n in added),

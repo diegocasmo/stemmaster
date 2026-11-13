@@ -44,7 +44,7 @@ def test_a_cut_logs_into_its_song(tmp_path):
     assert [(line["cut"], line["exit"]) for line in lines(tmp_path / "renders" / "timings.jsonl")] == [("b-c", 2)]
 
 
-def prewarmed(tmp_path, monkeypatch, moves):
+def prewarmed(tmp_path, monkeypatch, moves, free=lambda: 0.9):
     """Runs the evidence of a one-bass song with one worker process, which keeps the test small."""
     import evidence
     import structure
@@ -59,7 +59,7 @@ def prewarmed(tmp_path, monkeypatch, moves):
     (song / "recipe.json").write_text(json.dumps(recipe))
     monkeypatch.setenv(workers.ENV, "2")
     monkeypatch.setenv("STEMMASTER_NODE_MEMO_DIR", str(tmp_path / "memo"))
-    monkeypatch.setattr(workers, "free_fraction", lambda: 0.9)
+    monkeypatch.setattr(workers, "free_fraction", free)
     monkeypatch.setattr(evidence, "RENDERS", [0])
     monkeypatch.setattr(workers, "RENDERS", [0])
     real = workers.futures.ProcessPoolExecutor
@@ -89,6 +89,43 @@ def test_a_failed_worker_part_still_counts_its_renders(tmp_path, monkeypatch):
                                           {"move": "bass.hpf", "source": "bass", "decision": "dropped"}])
 
     assert workers.RENDERS[0] > 0
+
+
+def test_a_memory_stop_still_counts_the_parts_that_finished(tmp_path, monkeypatch):
+    import workers
+
+    real, submitted, samples = workers.futures.wait, [], []
+
+    def wait(running, **kwargs):
+        submitted.extend(running)
+        return real(running, timeout=0)
+
+    def free():
+        # The second sample comes after the first part finished but before the check read its result.
+        samples.append(None)
+        for future in submitted:
+            future.result(timeout=60)
+        return 0.9 if len(samples) == 1 else 0.1
+
+    monkeypatch.setattr(workers.futures, "wait", wait)
+    prewarmed(tmp_path, monkeypatch, [{"move": "bass.hpf", "source": "bass", "decision": "kept", "steps": ["hpf"]},
+                                      {"move": "bass.mud-cut", "source": "bass", "decision": "dropped"}], free)
+
+    assert submitted and workers.RENDERS[0] > 0
+
+
+@pytest.mark.parametrize("moves", [None, 1])
+def test_malformed_moves_still_log_the_run(tmp_path, moves):
+    import check
+
+    (tmp_path / "stems").mkdir()
+    (tmp_path / "recipe.json").write_text(json.dumps({"stems": {}, "moves": moves}))
+
+    with pytest.raises(TypeError), runlog.logged("check", tmp_path / "recipe.json",
+                                                 lambda: check.details(tmp_path / "recipe.json", [], set())):
+        raise TypeError("the check's own failure")
+
+    assert [(line["scope"]["moves"], line["exit"]) for line in lines(tmp_path / "renders" / "timings.jsonl")] == [(None, 1)]
 
 
 def test_a_cut_linking_the_songs_recipe_logs_as_the_cut(tmp_path):
