@@ -9,6 +9,7 @@ import soundfile
 from scipy import ndimage, signal
 
 from analyze import BAND_CENTERS_HZ, SHORT_TERM_HOP_SECONDS, SHORT_TERM_SECONDS, loudness, measure
+from memo import memoized
 
 ROOT = Path(__file__).resolve().parents[3]
 VALLEY_BAND_HZ = (40, 150)
@@ -63,6 +64,7 @@ def rounded(value):
     return round(value, 2) if value is not None and math.isfinite(value) else None
 
 
+@memoized
 def valley(audio, rate, times):
     if len(times) < 2:
         return {"gaps": 0, "skipped_short_gaps": 0, "silent_gaps": 0, "valley_db": None}
@@ -91,6 +93,7 @@ def mask_from(length, times, window_ms, rate):
     return inside
 
 
+@memoized
 def overlap(first, second, rate, bands, inside=None):
     # Only masked samples count, in the 6 dB test and in both sums alike, so "on hits" compares like with like.
     if len(first) != len(second):
@@ -136,6 +139,7 @@ def lag(reference, delayed, rate):
     return int(np.argmax(correlation[middle - reach : middle + reach + 1])) - reach
 
 
+@memoized
 def dip(before, after, rate, times):
     shift = lag(before, after, rate)
     if shift is None:
@@ -169,6 +173,7 @@ def k_weighted_cumulative(audio, rate):
     return np.concatenate([[0.0], np.cumsum(np.sum(weighted**2, axis=1))])
 
 
+@memoized
 def sections(audio, rate, named, low=None, high=None):
     filtered = band(audio, rate, low, high)
     integrated = loudness(filtered, rate)[0]["integrated_lufs"]
@@ -192,6 +197,8 @@ def sections(audio, rate, named, low=None, high=None):
     return result
 
 
+@memoized(context=lambda args: (ROOT / "profiles" / args["name"] / "profile.json").read_bytes()
+          if args["name"] is not None else None)
 def profile_range(audio, rate, name):
     if name is None:
         return {"skipped": "no profile"}
