@@ -148,5 +148,5 @@ def test_a_note_edit_gives_the_same_report_bytes(bass, song, check):
     warm, renders = check(bass)
 
     assert renders == 0
-    assert set(cold["notes"]) == {"bass", "guitars"}
+    assert list(cold["notes"]) == ["bass", "guitars"]
     assert [(report / name).read_bytes() for name in ("report.json", "report.md")] == files

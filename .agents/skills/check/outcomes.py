@@ -163,6 +163,7 @@ class Context:
 
     def source_notes(self, source):
         """Notes of each played stem, found on that stem itself (DIs are never used)."""
+        # Listed on every read, not only the first: a cached contract must replay every source it reads.
         if source not in self.notes_read:
             self.notes_read.append(source)
         if source not in self.notes:

@@ -788,7 +788,7 @@ def report(recipe, song, nodes, master_mode=False):
             entry["off"] = variants.battery(off_key(recipe, record))
         records.append(entry)
     numbers = {"timing_stems": timing_stems, "hits": counts, "windows": windows_summary(ctx), "questions": intent_questions(recipe, song, ctx),
-               "notes": ctx.notes_summary, "current": current, "records": records, "contracts": contract}
+               "notes": source_order(recipe, ctx.notes_summary), "current": current, "records": records, "contracts": contract}
     (cache / "report.json").write_text(json.dumps(numbers, indent=1))
     (cache / "report.md").write_text(markdown(numbers))
     return cache / "report.md", numbers
@@ -829,6 +829,10 @@ def windows_summary(ctx):
     return out
 
 
+def source_order(recipe, summary):
+    # Contracts run in cache-key order, which says nothing about the song, so the report lists sources as the recipe does.
+    order = {source: i for i, source in enumerate(recipe.get("sources", {}))}
+    return dict(sorted(summary.items(), key=lambda item: order.get(item[0], len(order))))
 
 
 def notes_tool_summary(found):
