@@ -463,3 +463,10 @@ def test_a_scoped_prompt_on_a_tiny_song(tmp_path, reviews, monkeypatch):
     assert review.master_errors(reviews.recipe, now) != []
     reviews.review(now)
     assert review.master_errors(reviews.recipe, now) == []
+
+
+def test_the_mix_fingerprint_binds_stem_order():
+    mix = {"stems": {"a.wav": {"gain_db": 0}, "b.wav": {"gain_db": -3}}}
+    swapped = {"stems": dict(reversed(mix["stems"].items()))}
+    assert review.fingerprint(mix, ["inputs"]) == review.fingerprint(json.loads(json.dumps(mix)), ["inputs"])
+    assert review.fingerprint(mix, ["inputs"]) != review.fingerprint(swapped, ["inputs"])
