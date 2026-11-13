@@ -20,11 +20,14 @@ ENV = "STEMMASTER_CHECK_WORKERS"
 # Kept free for the rest of the machine while workers run.
 FREE_FLOOR = 0.30
 POLL_S = 1.0
-# A worker's peak is its interpreter and plugins plus a few renders, each holding every tap at full length. Song 000's
-# 90 s cut measured 2.28 tapped signals per worker; the default keeps a margin over that.
+# A worker's peak is its interpreter and plugins plus the render it is making: a render's taps, mix and trial master
+# wait on disk, a few at a time in memory. Synthetic songs measured 0.76 tapped signals per worker (2.84 when every tap
+# was held, against song 000's 2.28); the default keeps a margin over that.
 BASE_BYTES = 600 << 20
-TAP_SIGNALS = 2.5
+TAP_SIGNALS = 1.0
 PEAKS = "workers.json"
+# Named for the code that measured it: a peak measured while every tap was held says nothing about this code's.
+FACTOR = "per_tapped_signal_spilled"
 _STATE = {}
 
 
@@ -52,7 +55,7 @@ def peak_bytes():
 
 def recorded(cache):
     try:
-        return float(json.loads((cache / PEAKS).read_text())["per_tapped_signal"])
+        return float(json.loads((cache / PEAKS).read_text())[FACTOR])
     except Exception:
         return 0.0
 
@@ -69,7 +72,7 @@ def record(cache, signal_bytes, taps, peaks):
     try:
         if peaks and signal_bytes * taps:
             per_signal = max(recorded(cache), (max(peaks) - BASE_BYTES) / (signal_bytes * taps))
-            evidence.write_atomic(cache / PEAKS, json.dumps({"per_tapped_signal": per_signal, "peak_bytes": max(peaks)}))
+            evidence.write_atomic(cache / PEAKS, json.dumps({FACTOR: per_signal, "peak_bytes": max(peaks)}))
     except Exception as error:
         evidence.progress(f"workers: peak not recorded: {error}")
 

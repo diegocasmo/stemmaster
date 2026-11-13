@@ -224,20 +224,27 @@ def test_a_small_songs_peak_keeps_the_estimate_scaling_with_length(tmp_path, mon
     workers.record(tmp_path, 44100 * 16, 1, [172 << 20])
 
     assert workers.estimate(tmp_path, signal, taps) == before
-    assert workers.count(20, before, free=0.8, total=16 * GB, cpus=8) == 1
+    assert workers.count(20, before, free=0.8, total=16 * GB, cpus=8) == 2
 
 
-# Song 000's 90 s cut: 26 tapped signals of 63.8 MB, a measured worker peak of 4.41 GB.
+# Song 000's 90 s cut: 26 tapped signals of 63.8 MB. Its worker peaked at 4.41 GB with every tap held; synthetic
+# songs project 1.6 to 1.8 GB with taps on disk.
 SONG_SIGNAL, SONG_TAPS = round(90.457 * 44100) * 16, 26
 
 
-@pytest.mark.parametrize("free, expected", [(0.9, 2), (1.0, 2), (0.8, 1)])
-def test_a_90_s_song_on_16_gb_gets_two_workers_when_they_fit(tmp_path, monkeypatch, free, expected):
+@pytest.mark.parametrize("free, expected", [(1.0, 5), (0.9, 4), (0.7, 3), (0.65, 2), (0.4, 1)])
+def test_a_90_s_song_on_16_gb_gets_three_workers_at_70_percent_free(tmp_path, monkeypatch, free, expected):
     monkeypatch.delenv(workers.ENV)
     need = workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS)
 
-    assert need > 4414734336
+    assert need > 1.8e9
     assert workers.count(20, need, free=free, total=16 * GB, cpus=8) == expected
+
+
+def test_a_peak_measured_with_every_tap_held_is_not_read(tmp_path):
+    (tmp_path / workers.PEAKS).write_text(json.dumps({"per_tapped_signal": 2.28, "peak_bytes": 4414734336}))
+
+    assert workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS) == workers.BASE_BYTES + workers.TAP_SIGNALS * SONG_SIGNAL * SONG_TAPS
 
 
 def test_a_peak_that_cant_be_written_never_fails_the_check(tmp_path):
@@ -275,7 +282,7 @@ def no_pool(*args, **kwargs):
 
 def read_only_peaks(cache):
     cache.mkdir(parents=True)
-    (cache / workers.PEAKS).write_text(json.dumps({"per_tapped_signal": 8, "peak_bytes": 400 << 20}))
+    (cache / workers.PEAKS).write_text(json.dumps({workers.FACTOR: 8, "peak_bytes": 400 << 20}))
     (cache / workers.PEAKS).chmod(0o444)
 
 
