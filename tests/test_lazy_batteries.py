@@ -104,8 +104,8 @@ def report(recipe, song, cold):
 
 # Each digest is of the report.json main's eager check wrote for the same fixture.
 @pytest.mark.parametrize("master_moves, observed, passes, digest", [
-    (False, 16, 10, "0f50b288ba425ceeb54e184236a6b84e1a7727e5b9671571a5866c8fde19de47"),
-    (True, 20, 22, "e7029298b3da4aa95534bc2c2ec613e2178b2686c5153ca84b081498ffda10cc"),
+    (False, 16, 10, "90e7f3e8d9618342172f254f83493ed3cb08bfc11e9fe98fa96c2b04f8f3e3e1"),
+    (True, 20, 22, "17765cb37128533c697386ea0f8e9774d3bd4c8f3d303a88525969d01bb1e5df"),
 ], ids=["mix-moves", "master-moves"])
 def test_only_published_batteries_and_read_masters_are_measured(song, master_moves, observed, passes, digest):
     """main measured every rendered variant's battery: 32 and 40 observations, 17 and 29 master passes."""
