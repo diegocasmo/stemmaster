@@ -115,9 +115,6 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
     import evidence
     import render
 
-    for temp in variants.cache.glob("*.tmp"):
-        # Left by a killed worker or check; nothing reads them.
-        temp.unlink(missing_ok=True)
     todo = parts(recipe, variants, ctx, master_mode)
     if len(todo) < 2:
         return
