@@ -6,6 +6,7 @@ import platform
 import py_compile
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -732,9 +733,45 @@ def test_seen_markers_count_toward_the_cap_and_go_least_recently_used_first(tmp_
     memo = render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)
     for key in "abc":
         memo.put(K[key], AUDIO)
-    assert kept(render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)) == ["b.seen", "c.seen"]
+    assert kept(memo) == ["b.seen", "c.seen"]
     memo.put(K["a"], AUDIO)
-    assert memo.get(K["a"]) is None and kept(memo) == ["a.seen", "b.seen", "c.seen"]
+    assert memo.get(K["a"]) is None and kept(memo) == ["a.seen", "c.seen"]
+
+
+def test_markers_alone_keep_the_folder_under_its_cap(tmp_path):
+    cap = 10 * render.MEMO_BLOCK_BYTES
+    memo = render.Memo(tmp_path, cap)
+    for index in range(30):
+        memo.put(f"{index:064x}", AUDIO)
+    assert len(list(tmp_path.iterdir())) * render.MEMO_BLOCK_BYTES <= cap + min(cap // 100, render.MEMO_MARKER_BUDGET_BYTES)
+
+
+@pytest.mark.parametrize("make", [os.mkdir, os.mkfifo])
+def test_a_folder_or_fifo_at_a_cache_path_is_a_miss_that_keeps_no_descriptor(tmp_path, make):
+    memo = nodes(tmp_path)
+    make(memo.path(K["a"]))
+    descriptors = len(os.listdir("/dev/fd"))
+
+    class Hung(BaseException):
+        pass
+
+    def hung(*_):
+        raise Hung
+
+    # A BaseException, so get()'s own except can't turn a hang into a miss.
+    previous = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(5)
+    try:
+        assert all(memo.get(K["a"]) is None for _ in range(50))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+    assert len(os.listdir("/dev/fd")) == descriptors
+
+
+def test_sightings_are_one_or_two(tmp_path):
+    with pytest.raises(ValueError):
+        render.Memo(tmp_path, sightings=3)
 
 
 def test_a_marker_is_charged_its_real_size(tmp_path):
@@ -770,3 +807,11 @@ def test_nothing_the_memo_creates_or_reads_follows_a_planted_link(song, tmp_path
         assert outputs(recipe, song, memo, probes=()) == outputs(recipe, song, None, probes=())
     assert not (tmp_path / "plugins").exists() and not (tmp_path / "elsewhere").exists()
     assert stored.get(K["b"]) is None
+
+
+def test_a_temp_file_left_under_this_pid_does_not_block_a_store(tmp_path):
+    memo = nodes(tmp_path)
+    path = memo.path(K["a"])
+    path.with_name(f"{path.stem}.{os.getpid()}.tmp").write_bytes(b"left by a killed process")
+    memo.put(K["a"], AUDIO)
+    assert memo.get(K["a"]) is not None

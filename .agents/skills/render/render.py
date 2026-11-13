@@ -130,6 +130,7 @@ CODE = code_digest(Path(__file__).with_name(name) for name in ("render.py", "nat
 MEMO_NAME = re.compile(r"([0-9a-f]{16})-[0-9a-f]{64}(\.npy|\.seen|\.\d+\.tmp)")
 # What an empty file takes on disk, so seen markers count toward the cap.
 MEMO_BLOCK_BYTES = 4096
+MEMO_MARKER_BUDGET_BYTES = 64 << 20
 
 
 def memo_folder():
@@ -170,9 +171,14 @@ class Memo:
     def __init__(self, folder, cap_bytes=MEMO_BYTES, sightings=2):
         if CODE is None:
             raise RuntimeError("a .pyc of render.py, native.py or airwindows.py holds other code than its source")
-        # Most outputs are computed once and never asked for again, so one is stored only on its `sightings`th
-        # computation; an empty .seen file remembers the first, across runs too.
+        # Most outputs are computed once and never asked for again, so with sightings=2 one is stored only on its
+        # second computation; an empty .seen file remembers the first, across runs too. sightings=1 stores on the first.
+        if sightings not in (1, 2):
+            raise ValueError(f"sightings must be 1 or 2, not {sightings!r}")
         self.folder, self.cap, self.sightings = Path(folder), cap_bytes, sightings
+        # Bytes of markers made since the last eviction: past a small budget they trigger one, so the cap holds even
+        # when nothing is stored.
+        self.marked = 0
         self.folder.mkdir(parents=True, exist_ok=True)
         self.bundles = {}
         self.ran = self.reused = 0
@@ -195,35 +201,42 @@ class Memo:
         path = self.path(key)
         # Any error is a miss: numpy's header parser can raise almost anything on damaged bytes.
         try:
-            # Nothing the memo opens or creates follows a link: one planted in the folder could point anywhere.
-            with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as file:
-                size = os.fstat(file.fileno()).st_size
-                header = file.read(10)
-                header += file.read(int.from_bytes(header[8:10], "little"))
-                parsed = io.BytesIO(header)
-                np.lib.format.read_magic(parsed)
-                shape, fortran, dtype = np.lib.format.read_array_header_1_0(parsed)
-                # Checked before the samples are read, so a damaged file can't ask for more memory than it should hold.
-                if (size > self.cap or dtype != np.float64 or not all(type(n) is int and n >= 0 for n in shape)
-                        or len(header) + 8 * math.prod(shape) + 32 != size):
+            # Nothing the memo opens or creates follows a link: one planted in the folder could point anywhere. Non
+            # blocking, so a FIFO there can't hang the render; only a regular file is read.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if not S_ISREG(os.fstat(descriptor).st_mode):
                     return None
-                # A header can agree with a damaged file's size, so the hash is checked in bounded reads before
-                # the samples get memory, then again on the bytes kept.
-                content, chunk = hashlib.sha256(header), bytearray(MEMO_CHUNK_BYTES)
-                for start in range(len(header), size - 32, len(chunk)):
-                    read = file.readinto(memoryview(chunk)[: min(len(chunk), size - 32 - start)])
-                    content.update(memoryview(chunk)[:read])
-                if content.digest() != file.read(32):
-                    return None
-                file.seek(len(header))
-                data = bytearray(size - len(header))
-                if file.readinto(data) != len(data):
-                    return None
-                content = hashlib.sha256(header)
-                content.update(memoryview(data)[:-32])
-                if content.digest() != data[-32:]:
-                    return None
-                os.utime(file.fileno())
+                with open(descriptor, "rb", closefd=False) as file:
+                    size = os.fstat(file.fileno()).st_size
+                    header = file.read(10)
+                    header += file.read(int.from_bytes(header[8:10], "little"))
+                    parsed = io.BytesIO(header)
+                    np.lib.format.read_magic(parsed)
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(parsed)
+                    # Checked before the samples are read, so a damaged file can't ask for more memory than it should.
+                    if (size > self.cap or dtype != np.float64 or not all(type(n) is int and n >= 0 for n in shape)
+                            or len(header) + 8 * math.prod(shape) + 32 != size):
+                        return None
+                    # A header can agree with a damaged file's size, so the hash is checked in bounded reads before
+                    # the samples get memory, then again on the bytes kept.
+                    content, chunk = hashlib.sha256(header), bytearray(MEMO_CHUNK_BYTES)
+                    for start in range(len(header), size - 32, len(chunk)):
+                        read = file.readinto(memoryview(chunk)[: min(len(chunk), size - 32 - start)])
+                        content.update(memoryview(chunk)[:read])
+                    if content.digest() != file.read(32):
+                        return None
+                    file.seek(len(header))
+                    data = bytearray(size - len(header))
+                    if file.readinto(data) != len(data):
+                        return None
+                    content = hashlib.sha256(header)
+                    content.update(memoryview(data)[:-32])
+                    if content.digest() != data[-32:]:
+                        return None
+                    os.utime(descriptor)
+            finally:
+                os.close(descriptor)
             audio = np.frombuffer(data, np.float64, math.prod(shape))
             self.used(path)
         except Exception:
@@ -246,15 +259,23 @@ class Memo:
             if self.sightings > 1:
                 seen = path.with_suffix(".seen")
                 try:
-                    # A marker costs one block, so eviction waits for the next store.
                     os.close(os.open(seen, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644))
+                    self.marked += MEMO_BLOCK_BYTES
+                    if self.marked > min(self.cap // 100, MEMO_MARKER_BUDGET_BYTES):
+                        self.evict()
                     return
                 except FileExistsError:
                     if not S_ISREG(seen.lstat().st_mode):
                         return
             content = hashlib.sha256(header)
             content.update(layout(audio))
-            descriptor = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+            try:
+                descriptor = os.open(temp, flags, 0o644)
+            except FileExistsError:
+                # Left by a killed process whose pid this one reuses; unlink removes a link itself, never its target.
+                temp.unlink()
+                descriptor = os.open(temp, flags, 0o644)
             try:
                 with open(descriptor, "wb") as file:
                     file.write(header)
@@ -272,7 +293,7 @@ class Memo:
 
     def evict(self):
         # A future mtime (clock set back, files copied in) would outrank every new file, so it counts as oldest.
-        now, files, newest = time.time_ns(), [], {}
+        now, files, newest, self.marked = time.time_ns(), [], {}, 0
         try:
             entries = list(os.scandir(self.folder))
         except OSError:
