@@ -123,6 +123,40 @@ def test_a_scoped_pass_never_reaches_master_and_the_next_prompt_is_full(tmp_path
     assert review.master_errors(reviews.recipe, now) == []
 
 
+def test_a_scoped_prompt_lists_what_to_fix_and_how_to_check_it(tmp_path, reviews):
+    finding = "kick gate eats 3 soft hits\n(at 12.1 s: -9 dB)"
+    reviews.review(song_snapshot(tmp_path), verdict="fail", findings=[finding])
+    now = song_snapshot(tmp_path, gate=-30)
+
+    text, asked, plan = review.plan_review(now)
+
+    pack = review.pack_path(now)
+    assert f"Evidence pack: {pack} (sha256 {review.sha(pack.read_text())})" in text
+    assert all(line in text for line in review.FAST_PATHS)
+    assert "only a full review can clear the mix for mastering" in text
+    assert "- move:kick.gate@kick (settings, check changed): decision kept, default outcome kept" in text
+    assert f"- {review.finding_id('claude: ' + finding)}: claude: kick gate eats 3 soft hits\n  (at 12.1 s: -9 dB)" in text
+    spot = text.split("Spot checks, ")[1].split("\n\n")[0].splitlines()[1:]
+    assert [line.split(": ")[0] for line in spot] == [f"- {key}" for key in plan["spot"]] and len(spot) == review.SPOT_CHECKS
+    assert set(plan["spot"]) <= set(asked) and not set(plan["spot"]) & set(plan["questions"])
+
+
+@pytest.mark.parametrize("fixed_by", [(), ("codex",)], ids=["nobody", "one-reviewer"])
+def test_a_full_pass_with_an_open_finding_never_masters(tmp_path, reviews, fixed_by):
+    reviews.review(song_snapshot(tmp_path), verdict="fail", findings=["snare tail cut by 6 dB"])
+    now = song_snapshot(tmp_path, others=1.0)
+    text, asked, plan = review.plan_review(now)
+    assert plan["base"] is None and plan["findings"]
+    fixed = {k: "fixed" for k in plan["findings"]}
+    claude = reviews.claude([user(text), said(reply(now, asked, status=fixed if "claude" in fixed_by else None))])
+    reviews.record(now, claude, reviews.codex(text, reply(now, asked, status=fixed if "codex" in fixed_by else None)))
+
+    errors = review.master_errors(reviews.recipe, now)
+
+    assert any("mix review by claude: findings not given status fixed" in e for e in errors)
+    assert any(e.startswith("open finding") and "snare tail cut by 6 dB" in e for e in errors)
+
+
 def test_a_later_review_of_the_mix_blocks_master(tmp_path, reviews):
     snap = song_snapshot(tmp_path)
     reviews.review(snap)
@@ -273,6 +307,8 @@ def test_a_broken_transcript_is_skipped_and_never_crashes(tmp_path, reviews, cap
     claude = next((tmp_path / "claude" / "project").glob("*.jsonl"))
     claude.write_text(claude.read_text() + '\n{"type": "assistant", "mess')
     (tmp_path / "claude" / "project" / f"{uuid.uuid4()}.jsonl").write_bytes(b'\xff\xfe{"timestamp": "x", ' + review.MARKER.encode() + b"\n")
+    codex = next((tmp_path / "codex" / "2026").glob("*.jsonl"))
+    codex.write_text('[1, 2]\n"text"\n{"type": "response_item", "payload": "not an object"}\n' + codex.read_text() + "\n{")
     now = song_snapshot(tmp_path, gate=-30)
 
     text, plan = reviews.review(now, fix=True)
