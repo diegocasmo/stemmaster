@@ -4,12 +4,15 @@ from pathlib import Path
 
 import chains
 import contracts
+import evidence
 import review
+import runlog
 import structure
 from evidence import inputs, progress, render, report
 
 USAGE = "usage: uv run .agents/skills/check/check.py [--master | --review-prompt] [--no-report] songs/<id>/recipe.json"
 FLAGS = ("--master", "--no-report", "--review-prompt")
+RUN = {}
 
 
 def structural(recipe, song, master):
@@ -70,6 +73,7 @@ def main():
             print("\n".join(f"fail: the mix without its master moves: {error}" for error in errors))
             sys.exit(1)
     path, numbers = report(recipe, song, nodes, master)
+    RUN["contracts"] = len(numbers["contracts"])
     fails = [f"{c['move']} on {c['source']}: {fail}" for c in numbers["contracts"] for fail in c["fails"]]
     for key, text in sorted(review.questions(numbers).items()):
         print(f"review: {key}: {text}")
@@ -87,8 +91,30 @@ def main():
         print(json.dumps(entry))
 
 
-if __name__ == "__main__":
+def cache_files(recipe_path):
+    """Contract and battery files in the check's cache: the ones a run adds are the parts it computed cold."""
+    cache = Path(recipe_path).parent / "renders" / "check"
+    names = {p.name for p in cache.glob("*.json")} if cache.is_dir() else set()
+    return {name for name in names if name.startswith("contract-") or len(name) == 69}
+
+
+def details(recipe_path, flags, before):
+    added = cache_files(recipe_path) - before
     try:
-        main()
+        moves = len(json.loads(Path(recipe_path).read_text()).get("moves", []))
+    except (OSError, ValueError, AttributeError):
+        moves = None
+    return {"scope": {"flags": flags, "moves": moves},
+            "counts": {"contracts": RUN.get("contracts"), "contracts_cold": sum(n.startswith("contract-") for n in added),
+                       "batteries_cold": sum(not n.startswith("contract-") for n in added), "variant_renders": evidence.RENDERS[0]}}
+
+
+if __name__ == "__main__":
+    recipe_path = next((arg for arg in sys.argv[1:] if not arg.startswith("--")), None)
+    flags = [arg for arg in sys.argv[1:] if arg.startswith("--")]
+    before = cache_files(recipe_path) if recipe_path else set()
+    try:
+        with runlog.logged("check", recipe_path, lambda: details(recipe_path, flags, before)):
+            main()
     finally:
         progress("done")

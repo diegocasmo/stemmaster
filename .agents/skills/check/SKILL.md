@@ -5,6 +5,7 @@ description: Check that a song's recipe records every chain move for every sourc
 
 - Run `uv run .agents/skills/check/check.py [--master | --review-prompt] songs/<id>/recipe.json`. It writes `renders/check/report.md` and `report.json`, prints every `review:` question and `fail:`, and exits 1 on any failure. `--no-report` runs only the structural checks.
 - Run long checks in the background and wait for that job's own completion notice and exit status.
+- Each check and render appends one line to `songs/<id>/renders/timings.jsonl` (a cut's to its song's): start, end, wall seconds, peak memory of the process and of its largest worker, scope, contracts and batteries computed cold, and exit status. A killed (SIGKILL) run leaves none.
 - Progress and elapsed seconds go to stderr. Never wait with a `pgrep -f` loop: it can match its own shell.
 - It lints the `### <chain>.<move>` headings of `docs/mixing-chains/` and reads each move's **Tool** list.
 - `sources` names each instrument: `{"kick": {"chain": "kick", "stems": [...], "timing": "03_KickSample.wav"}}`.

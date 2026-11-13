@@ -784,5 +784,9 @@ if __name__ == "__main__":
             args = []
     if len(args) not in (1, 3):
         sys.exit("usage: uv run .agents/skills/render/render.py [--master] [--tap <name>]... <recipe.json> [<start_s> <end_s>]")
-    for path in render(args[0], *[float(t) for t in args[1:]], final=final, taps=taps):
-        print(path)
+    import runlog
+
+    scope = {"master": final, "taps": taps, "clip": args[1:] or None}
+    with runlog.logged("render", args[0], lambda: {"scope": scope}):
+        for path in render(args[0], *[float(t) for t in args[1:]], final=final, taps=taps):
+            print(path)
