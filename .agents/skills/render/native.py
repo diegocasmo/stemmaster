@@ -1,5 +1,6 @@
 import math
 
+import numba
 import numpy as np
 from scipy import signal
 
@@ -123,6 +124,17 @@ def smoothing(ms, rate):
     return math.exp(-1000 / (ms * rate)) if ms > 0 else 0.0
 
 
+# No fastmath: the compiled loop must give the same bits as the plain float64 loop it replaced.
+@numba.njit
+def follow(level, attack, release):
+    envelope, state = np.empty(len(level)), 0.0
+    for index in range(len(level)):
+        coefficient = attack if level[index] > state else release
+        state = coefficient * state + (1 - coefficient) * level[index]
+        envelope[index] = state
+    return envelope
+
+
 def duck(audio, rate, settings, context):
     key = context.key(settings["key"])
     if settings.get("key_band_hz") is not None:
@@ -130,11 +142,7 @@ def duck(audio, rate, settings, context):
     # Linked peak: one detector for all channels, so the duck never moves the stereo image.
     level = np.max(np.abs(key), axis=1)
     attack, release = smoothing(settings["attack_ms"], rate), smoothing(settings["release_ms"], rate)
-    envelope, state = np.empty(len(level)), 0.0
-    for index, value in enumerate(level.tolist()):
-        coefficient = attack if value > state else release
-        state = coefficient * state + (1 - coefficient) * value
-        envelope[index] = state
+    envelope = follow(level, attack, release)
     level_db = 20 * np.log10(np.maximum(envelope, 1e-10))
     over = np.maximum(0, level_db - settings["threshold_db"]) * (1 - 1 / settings["ratio"])
     gain = 10 ** (-np.minimum(settings["range_db"], over) / 20)
