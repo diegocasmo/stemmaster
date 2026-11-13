@@ -6,6 +6,7 @@ import pytest
 import soundfile
 
 import evidence
+import render
 import structure
 import workers
 
@@ -25,6 +26,14 @@ def hits(seconds, every, seed):
 
 def step(step_id, target, plugin, **settings):
     return {"id": step_id, "target": target, "plugin": plugin, "settings": settings}
+
+
+# Default trials: a plugin matched to equal loudness, and a send through plugins to a bus of its own. They need the
+# local VST3 bundles, which CI doesn't have.
+PLUGIN_TRIALS = [
+    {"move": "kick.saturate", "source": "kick", "decision": "dropped"},
+    {"move": "bass.chorus", "source": "bass", "decision": "dropped"},
+] if all((render.PLUGINS / f"{name}.vst3").exists() for name in ("T-Saturator", "ZL Equalizer 2", "Airwindows Consolidated")) else []
 
 
 def band(song, seconds):
@@ -66,10 +75,7 @@ def band(song, seconds):
                 step("bass-trial", "Bass.wav", "Limiter", threshold_db=-12)]}},
             {"move": "kick.hpf", "source": "kick", "decision": "dropped"},
             {"move": "guitars.align", "source": "guitars", "decision": "dropped"},
-            # Default trials: a plugin matched to equal loudness, and a send through plugins to a bus of its own.
-            {"move": "kick.saturate", "source": "kick", "decision": "dropped"},
-            {"move": "bass.chorus", "source": "bass", "decision": "dropped"},
-        ],
+        ] + PLUGIN_TRIALS,
     }
 
 
