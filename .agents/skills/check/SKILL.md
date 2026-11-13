@@ -4,6 +4,9 @@ description: Check that a song's recipe records every chain move for every sourc
 ---
 
 - Run `uv run .agents/skills/check/check.py [--master | --review-prompt] songs/<id>/recipe.json`. It writes `renders/check/report.md` and `report.json`, prints every `review:` question and `fail:`, and exits 1 on any failure. `--no-report` runs only the structural checks.
+- Tune moves on a cut, then check the whole song once, before `--review-prompt`. `uv run .agents/skills/check/cut.py songs/<id>/recipe.json <section> [<last_section>]` (or `<start_s> <end_s>`, about 45 s) writes `songs/<id>/renders/cuts/<name>/recipe.json`, which `check.py` and `render.py` take like any song's. Edit the song's recipe, then cut and check again.
+  - Every recipe stem is cut at the same raw samples, so offsets hold. Sections and Ride segments are clipped to the window, and sections under 3 s dropped. A Ride left with no segment gets a 0 dB one, which the check reports as doing nothing.
+  - Processing starts cold at the cut's start, so its first seconds differ from the whole song. A cut is never reviewed or mastered.
 - Run long checks in the background and wait for that job's own completion notice and exit status.
 - Progress and elapsed seconds go to stderr. Never wait with a `pgrep -f` loop: it can match its own shell.
 - It lints the `### <chain>.<move>` headings of `docs/mixing-chains/` and reads each move's **Tool** list.
