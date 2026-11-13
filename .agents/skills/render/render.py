@@ -1,3 +1,4 @@
+import ctypes
 import json
 import math
 import sys
@@ -29,6 +30,8 @@ MAX_TRUE_PEAK_DBTP = -1.0
 LUFS_TOLERANCE = 0.005
 MASTER_IN = "master-in"
 RESERVED = {MASTER_IN, "premaster", "trial"}
+LIBC = ctypes.CDLL(None)
+RAND_SEED = 1
 
 
 def load(step):
@@ -37,6 +40,9 @@ def load(step):
     if not bundle.exists():
         return getattr(pedalboard, name)(**settings)
     # A fresh instance per step: reset() does not clear every plugin's state, so reuse changes the sound.
+    # Dragonfly and Airwindows draw on the process-wide C rand(), so without a fixed seed their output depends on
+    # how many plugins loaded before them in this process.
+    LIBC.srand(RAND_SEED)
     plugin = pedalboard.load_plugin(str(bundle))
     if "effect" in settings:
         airwindows.select(plugin, settings.pop("effect"))
