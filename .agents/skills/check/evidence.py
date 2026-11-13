@@ -136,12 +136,21 @@ def placed_stem(recipe, song, stem, length):
     return render.place(audio, recipe["stems"][stem].get("offset_samples", 0), length)
 
 
+def added(audio, rate, onsets):
+    """The power each onset adds over what was already ringing in the 15 ms before it."""
+    level = hit_tools.envelope_db((audio**2).sum(axis=1), rate)
+    reach, hold = round(hit_tools.ATTACK_MS[1] / 1000 * rate), round(hit_tools.HOLD_MS / 1000 * rate)
+    # In a fill the last tom still rings louder than the next tom's hit, so peak levels alone would hand it the hit.
+    return np.array([10 ** (level[t : t + reach].max() / 10) - 10 ** (level[max(0, t - hold) : t].max(initial=-200) / 10)
+                     for t in onsets])
+
+
 def own_tom_hits(recipe, song, sources, times, stem, onsets, rate, length):
     """A tom mic's onsets that are the tom, not the rest of the kit it also hears.
 
     At every hit of another drum the tom mic sits a near fixed level under each of that drum's mics, so an onset on
-    such a hit is kept only when it is at least 6 dB louder than that bleed predicts. A tom's own hit is loudest in its
-    own mic of all the tom mics, and close to the cymbal mics: kit bleed sits 6 dB or more under them.
+    such a hit is kept only when it is at least 6 dB louder than that bleed predicts. A tom's own hit adds more to its
+    own mic than to any other tom mic, and is close to the cymbal mics: kit bleed sits 6 dB or more under them.
     """
     tom = placed_stem(recipe, song, stem, length)
     keep = np.ones(len(onsets), dtype=bool)
@@ -155,7 +164,7 @@ def own_tom_hits(recipe, song, sources, times, stem, onsets, rate, length):
             other = placed_stem(recipe, song, mic, length)
             there = hit_tools.measure(other, rate, onsets)["level_db"]
             if source.get("chain") == "toms":
-                keep &= ~(there > here)
+                keep &= ~(added(other, rate, onsets) > added(tom, rate, onsets))
                 continue
             if source.get("chain") == "overheads":
                 keep &= ~(there >= here + OWN_HIT_DB)
