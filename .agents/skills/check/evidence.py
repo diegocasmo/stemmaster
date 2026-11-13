@@ -105,6 +105,37 @@ def record_part(record):
     return out
 
 
+LEVEL_PLUGINS = ("Gain", "Ride", "Duck")
+
+
+def feeders(recipe):
+    found = {}
+    for name, settings in list(recipe["stems"].items()) + list(recipe.get("buses", {}).items()):
+        found.setdefault(settings.get("bus", "mix"), set()).add(name)
+        for send in settings.get("sends", []):
+            found.setdefault(send["bus"], set()).add(name)
+    return found
+
+
+def returns_from(recipe):
+    """Buses fed only by sends."""
+    routed = {settings.get("bus", "mix") for settings in list(recipe["stems"].values()) + list(recipe.get("buses", {}).values())}
+    return [bus for bus in dict.fromkeys(send["bus"] for settings in list(recipe["stems"].values()) + list(recipe.get("buses", {}).values())
+                                         for send in settings.get("sends", [])) if bus not in routed]
+
+
+def return_chain(recipe, bus):
+    """A return and what it feeds, by route or send, that nothing else feeds: what only the return's signal passes through."""
+    chain, into, todo = {bus}, feeders(recipe), [bus]
+    while todo:
+        settings = recipe.get("buses", {}).get(todo.pop(), {})
+        for following in [settings.get("bus", "mix")] + [send["bus"] for send in settings.get("sends", [])]:
+            if following != "mix" and following not in chain and into.get(following, set()) <= chain:
+                chain.add(following)
+                todo.append(following)
+    return chain
+
+
 def off_variant(recipe, record):
     variant = copy.deepcopy(recipe)
     claimed = set(record.get("steps", []))
@@ -119,6 +150,16 @@ def off_variant(recipe, record):
             name, key = rest.rsplit(".", 1)
             if key in CLAIMED_FIELDS:
                 entries[name].pop(key, None)
+    # A send-only return the record leaves with nothing but level on it, down to where other parts join, would pass its
+    # sends through dry, so every send into it is muted, even ones the record can't claim.
+    removed = {step["target"] for step in recipe.get("steps", []) if step.get("id") in claimed}
+    for bus in returns_from(variant):
+        chain = return_chain(variant, bus)
+        wet = any(step["target"] in chain and step["plugin"] not in LEVEL_PLUGINS for step in variant["steps"])
+        if chain & removed and not wet:
+            for settings in list(variant["stems"].values()) + list(variant.get("buses", {}).values()):
+                if any(send["bus"] == bus for send in settings.get("sends", [])):
+                    settings["sends"] = [send for send in settings["sends"] if send["bus"] != bus]
     return variant
 
 
