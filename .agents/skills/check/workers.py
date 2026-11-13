@@ -147,6 +147,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
             finished, running = futures.wait(running, timeout=POLL_S, return_when=futures.FIRST_COMPLETED)
             for future in finished:
                 if future.exception() is not None:
+                    RENDERS[0] += getattr(future.exception(), "worker_renders", 0)
                     # The check meets the same error itself, in its own order, when it computes this part.
                     evidence.progress(f"workers stopped: {type(future.exception()).__name__}: {future.exception()}")
                     return
@@ -191,20 +192,31 @@ def _start(recipe, song, nodes, master_mode, planned, outside):
     _STATE.update(recipe=recipe, song=song, nodes=nodes, master_mode=master_mode, variants=variants, ctx=ctx)
 
 
+def _renders():
+    """The renders this worker did since it last reported, so the ones _start did count once."""
+    import evidence
+
+    renders, _STATE["counted"] = evidence.RENDERS[0] - _STATE.get("counted", 0), evidence.RENDERS[0]
+    return renders
+
+
 def _run(contracts, published):
     import evidence
 
     state, started = _STATE, time.monotonic()
     if "refused" in state:
         raise RuntimeError(state["refused"])
-    variants = state["variants"]
-    evidence.contract_report(state["recipe"], state["song"], state["nodes"], variants, state["ctx"], state["master_mode"],
-                             only={tuple(c) for c in contracts})
-    for key in published:
-        variants.battery(key)
+    try:
+        variants = state["variants"]
+        evidence.contract_report(state["recipe"], state["song"], state["nodes"], variants, state["ctx"], state["master_mode"],
+                                 only={tuple(c) for c in contracts})
+        for key in published:
+            variants.battery(key)
+    except BaseException as error:
+        # Renders finished before the error still ran; the exception carries their count back to the check.
+        error.worker_renders = _renders()
+        raise
     # Only the current render is shared between parts; the rest would hold memory the next part needs.
     for key in [k for k in variants.views if k != "current"]:
         variants.drop(key)
-    # Since this worker's last part, so the renders _start did count once.
-    renders, state["counted"] = evidence.RENDERS[0] - state.get("counted", 0), evidence.RENDERS[0]
-    return peak_bytes(), time.monotonic() - started, renders
+    return peak_bytes(), time.monotonic() - started, _renders()

@@ -44,8 +44,8 @@ def test_a_cut_logs_into_its_song(tmp_path):
     assert [(line["cut"], line["exit"]) for line in lines(tmp_path / "renders" / "timings.jsonl")] == [("b-c", 2)]
 
 
-def test_a_check_counts_the_renders_its_workers_did(tmp_path, monkeypatch):
-    import check
+def prewarmed(tmp_path, monkeypatch, moves):
+    """Runs the evidence of a one-bass song with one worker process, which keeps the test small."""
     import evidence
     import structure
     import workers
@@ -55,8 +55,7 @@ def test_a_check_counts_the_renders_its_workers_did(tmp_path, monkeypatch):
     write(song, "Bass.wav", noise(1))
     recipe = {"stems": {"Bass.wav": {}}, "sources": {"bass": {"chain": "bass", "stems": ["Bass.wav"]}},
               "steps": [{"id": "hpf", "target": "Bass.wav", "plugin": "HighpassFilter", "settings": {"cutoff_frequency_hz": 40}}],
-              "moves": [{"move": "bass.hpf", "source": "bass", "decision": "kept", "steps": ["hpf"]},
-                        {"move": "bass.mud-cut", "source": "bass", "decision": "dropped"}]}
+              "moves": moves}
     (song / "recipe.json").write_text(json.dumps(recipe))
     monkeypatch.setenv(workers.ENV, "2")
     monkeypatch.setenv("STEMMASTER_NODE_MEMO_DIR", str(tmp_path / "memo"))
@@ -64,13 +63,32 @@ def test_a_check_counts_the_renders_its_workers_did(tmp_path, monkeypatch):
     monkeypatch.setattr(evidence, "RENDERS", [0])
     monkeypatch.setattr(workers, "RENDERS", [0])
     real = workers.futures.ProcessPoolExecutor
-    # One worker process, so the test stays small.
     monkeypatch.setattr(workers.futures, "ProcessPoolExecutor", lambda *a, **k: real(1, **k))
-
     evidence.report(recipe, song, structure.nodes(recipe, structure.Routing(recipe), []))
+    return song
+
+
+def test_a_check_counts_the_renders_its_workers_did(tmp_path, monkeypatch):
+    import check
+    import evidence
+    import workers
+
+    song = prewarmed(tmp_path, monkeypatch, [{"move": "bass.hpf", "source": "bass", "decision": "kept", "steps": ["hpf"]},
+                                             {"move": "bass.mud-cut", "source": "bass", "decision": "dropped"}])
 
     assert workers.RENDERS[0] > 0
     assert check.details(song / "recipe.json", [], set())["counts"]["variant_renders"] == evidence.RENDERS[0] + workers.RENDERS[0]
+
+
+def test_a_failed_worker_part_still_counts_its_renders(tmp_path, monkeypatch):
+    import workers
+
+    bad = {"id": "bad", "target": "Bass.wav", "plugin": "Compressor", "settings": {"bogus": 1}}
+    with pytest.raises(TypeError):
+        prewarmed(tmp_path, monkeypatch, [{"move": "bass.mud-cut", "source": "bass", "decision": "dropped", "trial": {"steps": [bad]}},
+                                          {"move": "bass.hpf", "source": "bass", "decision": "dropped"}])
+
+    assert workers.RENDERS[0] > 0
 
 
 def test_a_cut_linking_the_songs_recipe_logs_as_the_cut(tmp_path):
