@@ -1,0 +1,131 @@
+import copy
+import json
+import os
+import shutil
+
+import pytest
+
+import evidence
+import incremental
+import structure
+from test_workers import band
+
+
+def check(song, recipe, memo, monkeypatch):
+    monkeypatch.setenv("STEMMASTER_NODE_MEMO_DIR", str(memo))
+    reused = []
+    monkeypatch.setattr(evidence, "progress", lambda message: reused.append(message) if "reused" in message else None)
+    nodes = structure.nodes(recipe, structure.Routing(recipe), [])
+    try:
+        evidence.report(json.loads(json.dumps(recipe)), song, nodes)
+    except BaseException as error:
+        return f"{type(error).__name__}: {error}", reused
+    return [(song / "renders" / "check" / name).read_bytes() for name in ("report.json", "report.md")], reused
+
+
+def setting(step_id, key, value):
+    def edit(recipe):
+        next(step for step in recipe["steps"] if step["id"] == step_id)["settings"][key] = value
+    return edit
+
+
+def stem(name, key, value):
+    def edit(recipe):
+        recipe["stems"][name][key] = value
+    return edit
+
+
+def send_gain(recipe):
+    recipe["stems"]["Snare.wav"]["sends"][0]["gain_db"] = -16
+
+
+def trial_setting(recipe):
+    record = next(r for r in recipe["moves"] if r["move"] == "snare.compress")
+    record["trial"]["steps"][0]["settings"]["ratio"] = 3
+
+
+def drop_guitar_filter(recipe):
+    recipe["steps"] = [step for step in recipe["steps"] if step["id"] != "gtr-hpf"]
+    recipe["moves"] = [r for r in recipe["moves"] if r["move"] != "guitars.filters"]
+
+
+EDITS = {
+    "compressor setting": setting("kick-comp", "ratio", 6),
+    "duck setting": setting("bass-duck", "range_db", 9),
+    "guitar filter": setting("gtr-hpf", "cutoff_frequency_hz", 120),
+    "master limiter": setting("master-limit", "threshold_db", -4),
+    "stem gain": stem("Bass.wav", "gain_db", -2),
+    "pan": stem("GtrL.wav", "pan", -0.6),
+    "polarity": stem("GtrR.wav", "invert", True),
+    "send level": send_gain,
+    "record trial": trial_setting,
+    "step and record removed": drop_guitar_filter,
+}
+
+
+@pytest.mark.parametrize("edit", list(EDITS), ids=list(EDITS))
+def test_a_recheck_after_an_edit_gives_the_cold_checks_bytes(tmp_path, monkeypatch, edit):
+    base = tmp_path / "base"
+    recipe = band(base, 1)
+    check(base, recipe, tmp_path / "memo", monkeypatch)
+    edited = copy.deepcopy(recipe)
+    EDITS[edit](edited)
+    fresh = tmp_path / "fresh"
+    (fresh / "stems").mkdir(parents=True)
+    for path in (base / "stems").iterdir():
+        os.link(path, fresh / "stems" / path.name)
+
+    again, _ = check(base, edited, tmp_path / "memo", monkeypatch)
+    cold, _ = check(fresh, edited, tmp_path / "memo-fresh", monkeypatch)
+
+    assert again == cold
+
+
+def test_an_edit_reuses_the_contracts_that_never_read_what_it_changed(tmp_path, monkeypatch):
+    recipe = band(tmp_path, 1)
+    check(tmp_path, recipe, tmp_path / "memo", monkeypatch)
+    EDITS["guitar filter"](recipe)
+
+    _, reused = check(tmp_path, recipe, tmp_path / "memo", monkeypatch)
+
+    # The kick, snare and bass contracts read nothing the guitar bus feeds but the mix.
+    assert reused and int(reused[0].split()[0]) >= 3
+
+
+def test_a_trace_whose_recorded_value_changed_does_not_hold(tmp_path, monkeypatch):
+    recipe = band(tmp_path, 1)
+    check(tmp_path, recipe, tmp_path / "memo", monkeypatch)
+    nodes = structure.nodes(recipe, structure.Routing(recipe), [])
+    planned = evidence.plan(recipe, tmp_path, nodes)
+    variants, ctx, _ = evidence.prepare(recipe, tmp_path, nodes, planned, evidence.inputs(tmp_path, recipe))
+    records, entries = evidence.contract_entries(recipe, variants, ctx, False)
+    traced = [(entry, json.loads(path.read_text())) for entry in entries
+              if (path := evidence.trace_path(variants, False, entry["record"])).exists()]
+    entry, trace = next((entry, trace) for entry, trace in traced if trace["values"])
+    static = evidence.trace_static(recipe, variants, ctx, False, records, entry)
+    assert incremental.holds(trace, variants.signal_keys, entry["keys"], variants, static)
+
+    trace["values"][0][-1] = "something else"
+
+    assert not incremental.holds(trace, variants.signal_keys, entry["keys"], variants, static)
+
+
+def test_reads_outside_a_contract_and_on_written_keys_are_not_recorded():
+    recipe = incremental.track({"stems": {"A.wav": {"bus": "drums", "gain_db": -3}}, "steps": []}, "current")
+    entry = recipe["stems"]["A.wav"]
+    entry.get("gain_db")
+    with incremental.recording() as trace:
+        entry.get("bus")
+        copied = copy.deepcopy(recipe)["stems"]["A.wav"]
+        copied["gain_db"] = 0
+        copied.get("gain_db")
+        with incremental.quiet():
+            entry.get("gain_db")
+    assert trace.values == {} and trace.complex is None
+
+    with incremental.recording() as trace:
+        entry.get("gain_db")
+        "pan" in entry
+        entry["gain_db"] = 1
+    assert list(trace.values.values()) == [-3, False]
+    assert trace.complex

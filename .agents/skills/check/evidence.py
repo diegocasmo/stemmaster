@@ -21,6 +21,7 @@ import measure
 from memo import memoized
 
 import contracts
+import incremental
 import outcomes as outcome_tools
 import workers
 from structure import CLAIMED_FIELDS, DRUM_CHAINS, Routing, apply_patch, fields_of, roles_of as structure_roles
@@ -42,7 +43,7 @@ CODE = [ROOT / ".agents" / "skills" / path for path in (
     "render/render.py", "render/native.py", "render/airwindows.py", "render/prepared.py",
     "analyze/analyze.py", "analyze/hits.py", "analyze/measure.py", "analyze/memo.py", "analyze/notes.py", "align/align.py",
     "check/evidence.py", "check/structure.py", "check/chains.py", "check/contracts.py", "check/outcomes.py",
-    "check/workers.py",
+    "check/workers.py", "check/incremental.py",
 )]
 
 
@@ -70,12 +71,13 @@ def fingerprint(*parts):
         if isinstance(value, np.ndarray):
             return value.tolist()
         if isinstance(value, dict):
-            return {str(k): plain(v) for k, v in value.items()}
+            return {str(k): plain(v) for k, v in dict.items(value)}
         if isinstance(value, (list, tuple)):
             return [plain(v) for v in value]
         return value
     # Dict order is kept: render sums stems, orders buses and applies settings in recipe order.
-    return hashlib.sha256(json.dumps(plain(list(parts))).encode()).hexdigest()
+    with incremental.quiet():
+        return hashlib.sha256(json.dumps(plain(list(parts))).encode()).hexdigest()
 
 
 TEXT = {"note", "reason", "review", "tool_reason", "chain_reason", "split_reason", "role_reason"}
@@ -242,12 +244,17 @@ class Master:
 
     def make(self):
         if self.made is None:
+            with incremental.quiet():
+                self._make()
+        return self.made
+
+    def _make(self):
+        if self.made is None:
             if self.target is None:
                 master_in, trial = self.result.master(self.result.mix)
                 self.made = {"drive_change_db": 0.0, "matched": False}, master_in, trial
             else:
                 self.made = matched_master(self.result, self.target)
-        return self.made
 
     def get(self, name):
         if not self.result.master_steps:
@@ -360,14 +367,16 @@ class Variants:
         self.recipe, self.song, self.cache, self.layout = recipe, song, cache, layout
         self.boundary, self.outside, self.ctx, self.taps = boundary, outside, ctx, taps
         self.views, self.batteries, self.probes = {}, {}, {}
-        self.recipes = {"current": recipe}
+        self.recipes = {"current": incremental.track(recipe, "current")}
         self.target = ctx.target
         self.memo = node_memo()
         self.published = set(published)
         self.contracts = None
+        self.signal_keys = incremental.Keys(self)
 
     def add(self, key, variant, probes=None):
-        self.recipes.setdefault(key, variant)
+        if key not in self.recipes:
+            self.recipes[key] = incremental.track(variant, key)
         if probes:
             self.probes.setdefault(key, {}).update(probes)
         return key
@@ -377,6 +386,10 @@ class Variants:
         return self.cache / f"{fingerprint(numeric(self.recipes[key]), self.target, self.boundary, self.outside, points, chain_times, chain_nodes)}.json"
 
     def battery(self, key):
+        with incremental.quiet():
+            return self._battery(key)
+
+    def _battery(self, key):
         if key not in self.batteries:
             path = self.battery_path(key)
             if path.exists():
@@ -395,6 +408,10 @@ class Variants:
         del self.views[key]
 
     def view(self, key):
+        with incremental.quiet():
+            return self._view(key)
+
+    def _view(self, key):
         if key in self.views:
             return self.views[key]
         # The current view stays; the others are dropped oldest first, since each render holds every tap.
@@ -424,9 +441,11 @@ class Variants:
                 if step["plugin"] not in render.NATIVE:
                     render.load(step)
         view = outcome_tools.View(self.ctx, result, master, variant)
+        view.key = key
         # A copy: a later master render (a contract reading the actual master) writes its probes into the mixer, and
         # every contract must read the same matched-drive probes whatever order the contracts run in.
-        view.probed = dict(result.mixer.probed)
+        view.probed = Probed(result.mixer.probed)
+        view.probed.key = key
         view.twin = lambda other: self.view(self.add(recipe_key(other), other))
         self.views[key] = view
         RENDERS[0] += 1
@@ -441,6 +460,24 @@ def release(variants):
     variants.views.clear()
     variants.batteries.clear()
     variants.ctx = variants.memo = None
+
+
+class Probed(dict):
+    """A view's step probes; a contract's read of one is recorded with the key of the step's input and output."""
+
+    key = None
+
+    def get(self, step_id, default=None):
+        incremental.reading(self.key, f"probe:{step_id}")
+        return dict.get(self, step_id, default)
+
+    def __getitem__(self, step_id):
+        incremental.reading(self.key, f"probe:{step_id}")
+        return dict.__getitem__(self, step_id)
+
+    def items(self):
+        incremental.give_up("read every probe of a view")
+        return dict.items(self)
 
 
 def node_tap(ctx, source):
@@ -511,6 +548,7 @@ def match_trial(variants, key, target, match_id):
     a, b = variants.view(key).lufs(f"tap:{target}", None), variants.view("current").lufs(f"tap:{target}", None)
     if a is None or b is None or abs(a - b) <= MATCH_TRIAL_LU:
         return
+    incremental.give_up("matched a trial's loudness")
     gain["settings"]["gain_db"] = round(b - a, 3)
     variants.views.pop(key, None)
     variants.batteries.pop(key, None)
@@ -759,6 +797,100 @@ def contract_path(recipe, variants, ctx, master_mode, records, entry):
     return variants.cache / f"contract-{key}.json"
 
 
+def evaluate_entry(recipe, variants, ctx, master_mode, records, entry, fact):
+    record, keys = entry["record"], entry["keys"]
+    ctx.notes_read = []
+    compare = entry["contract"].get("compare")
+    if compare == "alt" and "with" in keys:
+        with_key = keys["with"]
+        depth = {k: v.get("depth_db", 0.0) for k, v in variants.view(with_key).probed.items()}
+        judged = record.get("steps", []) + entry.get("probed", [])
+        keys["alt"] = variants.add(f"alt:{record['move']}:{record['source']}",
+                                   alt_variant(variants.recipes[with_key], {"steps": judged}, depth))
+    if compare == "tried" and master_mode:
+        keys["tried"] = [variants.add(f"tried:{i}", v) for i, v in enumerate(tried_variants(recipe, variants.boundary))]
+    if "with" in keys and any(leaf.get("measure") == "delay_gap_tail" for leaf in walk(entry["contract"]["worked"])):
+        nodelay = outcome_tools.without_lead_delays(ctx, record["source"], variants.recipes[keys["with"]])
+        if nodelay is not None:
+            keys["nodelay"] = variants.add(recipe_key(nodelay), nodelay)
+            nolead = outcome_tools.without_lead(ctx, record["source"], nodelay)
+            keys["nolead"] = variants.add(recipe_key(nolead), nolead)
+    if "trial" not in record and entry.get("probed"):
+        match_trial(variants, keys["with"], node_tap(ctx, record["source"]), entry.get("match"))
+    views = {role: [variants.view(k) for k in key] if isinstance(key, list) else variants.view(key) for role, key in keys.items()}
+    if compare == "options" and "without" not in keys:
+        # A dropped blend leaves the recipe's own options in place: only whether they are the best is read.
+        views["options_only"] = True
+    entry["views"] = views
+    entry["has_pair"] = "with" in views
+    if record.get("decision") in ("kept", "changed"):
+        entry["engaged"] = engaged(views["with"], record.get("steps", []), recipe)
+        if "nosend" in views:
+            # Only the sends are off in this variant, so the move's own dry gains can't stand in for an inaudible send.
+            entry["engaged"]["sends"] = delivered(views["with"], views["nosend"], ctx, record["source"])
+    elif "with" in keys and keys["with"] != "current":
+        entry["engaged"] = engaged(views["with"], entry.get("probed", []), variants.recipes[keys["with"]])
+        if "nosend" in views:
+            entry["engaged"]["sends"] = delivered(views["with"], views["nosend"], ctx, record["source"])
+    judged_recipe = variants.recipes[keys["with"]] if "with" in keys else recipe
+    trial_ids = [step["id"] for step in record.get("trial", {}).get("steps", [])] or entry.get("probed", [])
+    ctx.acting = outcome_tools.acting_point(judged_recipe, Routing(judged_recipe), record.get("steps", []) + trial_ids,
+                                            ctx.nodes.get(record["source"]), ctx.sources.get(record["source"], {}).get("stems", []),
+                                            chain_stems(ctx, record["source"]))
+    ctx.join_recipe = variants.recipes[keys["with"]] if "with" in keys else None
+    ctx.record = record
+    ctx.trial_ids = trial_ids + ([entry["match"]] if entry.get("match") else [])
+    base = variants.recipes[keys["base"]]
+    needed_leaves, worked_leaves = [], []
+    needed = outcome_tools.evaluate(entry["contract"]["needed"], record, views, facts(base, Routing(base), ctx, records),
+                                    "needed", needed_leaves)
+    worked = outcome_tools.evaluate(entry["contract"]["worked"], record, views, fact, "worked", worked_leaves, on_with=True) \
+        if "with" in views else None
+    evaluated = {"needed": needed, "worked": worked, "needed_read_on": keys["base"], "with": keys.get("with"),
+                 "without": keys.get("without"), "engaged": entry.get("engaged", {}),
+                 "leaves": needed_leaves + worked_leaves, "read_at": ctx.acting, "has_pair": entry["has_pair"]}
+    ctx.acting = ctx.join_recipe = ctx.record = None
+    ctx.trial_ids = []
+    return evaluated
+
+
+def trace_static(recipe, variants, ctx, master_mode, records, entry):
+    """contract_path's key with the recipe values a trace checks one by one left out."""
+    active = sorted({json.dumps([r.get("move"), r.get("decision")]) for r in records})
+    parts = {role: incremental.structure(variants.recipes[key]) for role, key in entry["keys"].items()}
+    unoverridden = {key: value for key, value in entry["record"].items() if key != "override"}
+    return fingerprint("trace", record_part(unoverridden), entry["contract"], parts, incremental.structure(recipe), active,
+                       sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
+
+
+def trace_path(variants, master_mode, record):
+    return variants.cache / f"trace-{fingerprint(record['move'], record['source'], master_mode)}.json"
+
+
+def promote(recipe, variants, ctx, master_mode):
+    """Writes the exact-key cache file of each contract whose last trace still holds, so the check reads it as cached."""
+    records, entries = contract_entries(recipe, variants, ctx, master_mode)
+    reused = 0
+    for entry in entries:
+        path = contract_path(recipe, variants, ctx, master_mode, records, entry)
+        found = trace_path(variants, master_mode, entry["record"])
+        if path.exists() or not found.exists():
+            continue
+        try:
+            trace = json.loads(found.read_text())
+        except ValueError:
+            continue
+        keys = entry["keys"]
+        if incremental.holds(trace, variants.signal_keys, keys, variants, trace_static(recipe, variants, ctx, master_mode, records, entry)):
+            # A traced contract matched no trial's loudness, so its trial's gain is the variant's own, as a cold run writes it.
+            payload = trace["payload"] | {"needed_read_on": keys["base"], "with": keys.get("with"), "without": keys.get("without"),
+                                          "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))}
+            write_atomic(path, json.dumps(payload))
+            reused += 1
+    if reused:
+        progress(f"{reused} contracts reused: nothing they read changed")
+
+
 def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
     """Every record's contract outcome; with `only`, just those (move, source) records, for a worker to cache."""
     records, entries = contract_entries(recipe, variants, ctx, master_mode)
@@ -782,63 +914,19 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
             # The key leaves out text and the override, so both come from the current record, never the cache.
             out.append(verdict(entry, cached))
             continue
-        ctx.notes_read = []
-        compare = entry["contract"].get("compare")
-        if compare == "alt" and "with" in keys:
-            with_key = keys["with"]
-            depth = {k: v.get("depth_db", 0.0) for k, v in variants.view(with_key).probed.items()}
-            judged = record.get("steps", []) + entry.get("probed", [])
-            keys["alt"] = variants.add(f"alt:{record['move']}:{record['source']}",
-                                       alt_variant(variants.recipes[with_key], {"steps": judged}, depth))
-        if compare == "tried" and master_mode:
-            keys["tried"] = [variants.add(f"tried:{i}", v) for i, v in enumerate(tried_variants(recipe, variants.boundary))]
-        if "with" in keys and any(leaf.get("measure") == "delay_gap_tail" for leaf in walk(entry["contract"]["worked"])):
-            nodelay = outcome_tools.without_lead_delays(ctx, record["source"], variants.recipes[keys["with"]])
-            if nodelay is not None:
-                keys["nodelay"] = variants.add(recipe_key(nodelay), nodelay)
-                nolead = outcome_tools.without_lead(ctx, record["source"], nodelay)
-                keys["nolead"] = variants.add(recipe_key(nolead), nolead)
-        if "trial" not in record and entry.get("probed"):
-            match_trial(variants, keys["with"], node_tap(ctx, record["source"]), entry.get("match"))
-        views = {role: [variants.view(k) for k in key] if isinstance(key, list) else variants.view(key) for role, key in keys.items()}
-        if compare == "options" and "without" not in keys:
-            # A dropped blend leaves the recipe's own options in place: only whether they are the best is read.
-            views["options_only"] = True
-        entry["views"] = views
-        entry["has_pair"] = "with" in views
-        if record.get("decision") in ("kept", "changed"):
-            entry["engaged"] = engaged(views["with"], record.get("steps", []), recipe)
-            if "nosend" in views:
-                # Only the sends are off in this variant, so the move's own dry gains can't stand in for an inaudible send.
-                entry["engaged"]["sends"] = delivered(views["with"], views["nosend"], ctx, record["source"])
-        elif "with" in keys and keys["with"] != "current":
-            entry["engaged"] = engaged(views["with"], entry.get("probed", []), variants.recipes[keys["with"]])
-            if "nosend" in views:
-                entry["engaged"]["sends"] = delivered(views["with"], views["nosend"], ctx, record["source"])
-        judged_recipe = variants.recipes[keys["with"]] if "with" in keys else recipe
-        trial_ids = [step["id"] for step in record.get("trial", {}).get("steps", [])] or entry.get("probed", [])
-        ctx.acting = outcome_tools.acting_point(judged_recipe, Routing(judged_recipe), record.get("steps", []) + trial_ids,
-                                                ctx.nodes.get(record["source"]), ctx.sources.get(record["source"], {}).get("stems", []),
-                                                chain_stems(ctx, record["source"]))
-        ctx.join_recipe = variants.recipes[keys["with"]] if "with" in keys else None
-        ctx.record = record
-        ctx.trial_ids = trial_ids + ([entry["match"]] if entry.get("match") else [])
-        base = variants.recipes[keys["base"]]
-        needed_leaves, worked_leaves = [], []
-        needed = outcome_tools.evaluate(entry["contract"]["needed"], record, views, facts(base, Routing(base), ctx, records),
-                                        "needed", needed_leaves)
-        worked = outcome_tools.evaluate(entry["contract"]["worked"], record, views, fact, "worked", worked_leaves, on_with=True) \
-            if "with" in views else None
-        evaluated = {"needed": needed, "worked": worked, "needed_read_on": keys["base"], "with": keys.get("with"),
-                     "without": keys.get("without"), "engaged": entry.get("engaged", {}),
-                     "leaves": needed_leaves + worked_leaves, "read_at": ctx.acting, "has_pair": entry["has_pair"]}
-        ctx.acting = ctx.join_recipe = ctx.record = None
-        ctx.trial_ids = []
+        static = trace_static(recipe, variants, ctx, master_mode, records, entry)
+        pristine = dict(keys)
+        with incremental.recording() as trace:
+            evaluated = evaluate_entry(recipe, variants, ctx, master_mode, records, entry, fact)
         # The sources this record read, in first-read order, so a cache hit adds them to the report as a cold run would.
         read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
         for source, summary in read.items():
             ctx.notes_summary.setdefault(source, summary)
-        write_atomic(path, json.dumps(evaluated | {"notes": read, "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))}))
+        payload = json.dumps(evaluated | {"notes": read, "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))})
+        write_atomic(path, payload)
+        found = incremental.finish(trace, variants.signal_keys, pristine, static, json.loads(payload))
+        if found is not None:
+            write_atomic(trace_path(variants, master_mode, record), json.dumps(found))
         out.append(verdict(entry, evaluated))
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
@@ -874,7 +962,7 @@ def delivered(on, off, ctx, source):
     dry = on.signal(node[0]) if node else None
     if dry is None:
         return None
-    added = float(((on.result.mix - off.result.mix) ** 2).sum())
+    added = float(((on.signal("mix") - off.signal("mix")) ** 2).sum())
     return round(10 * np.log10(max(added, 1e-30) / max(float((dry**2).sum()), 1e-30)), 2)
 
 
@@ -926,6 +1014,7 @@ def measured(recipe, song, nodes, master_mode=False):
     outside = inputs(song, recipe)
     variants, ctx, records = prepare(recipe, song, nodes, planned, outside)
     progress(f"report on {sum(r.get('move') != 'balance' for r in recipe.get('moves', []))} moves")
+    promote(recipe, variants, ctx, master_mode)
     workers.prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx)
     timing_stems, counts = planned[3], planned[4]
     contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)

@@ -17,6 +17,7 @@ from analyze import BAND_CENTERS_HZ
 from memo import memoized
 
 import contracts
+import incremental
 from structure import DRUM_CHAINS, Routing, roles_of
 
 TRUE, FALSE, UNRESOLVED, REVIEW, SKIPPED = "true", "false", "unresolved", "review", "skipped"
@@ -525,8 +526,11 @@ class View:
         self.twin = None
         self.cache = {}
         self.master = master or {}
+        # The check's name for the variant rendered here, which a recorded read names.
+        self.key = None
 
     def signal(self, name):
+        incremental.reading(self.key, name)
         if name in ("mix", "premaster"):
             return self.result.mix
         if name in ("trial", "master-in"):
@@ -727,7 +731,7 @@ def m_loud_rel(view, source, args):
         point, mix = view.lufs(args.get("point", "node"), source), view.lufs("mix", source)
         return None if None in (point, mix) else point - mix
     mask = view.ctx.window(args["window"], source)
-    audio, mix = view.audio(args.get("point", "node"), source), view.result.mix
+    audio, mix = view.audio(args.get("point", "node"), source), view.signal("mix")
     if mask is None or audio is None or not mask.any():
         return None
     meter = pyloudnorm.Meter(view.rate)
@@ -1257,7 +1261,7 @@ def m_section_error(view, source, args):
     sections = view.ctx.recipe.get("sections")
     if not sections or not all("loudness_lu" in s for s in sections.values()):
         return None
-    errors = [e.get("error_lu") for e in measure.sections(view.result.mix, view.rate, sections)["sections"].values()]
+    errors = [e.get("error_lu") for e in measure.sections(view.signal("mix"), view.rate, sections)["sections"].values()]
     # A section too short for a 3 s window has no reading, which leaves every-section checks unsupported.
     return None if None in errors or not errors else max(abs(e) for e in errors)
 
@@ -1497,7 +1501,12 @@ def m_limiter_work(view, source, args):
 
 def actual_master(view):
     """The master the recipe itself exports, with no drive added to reach the target."""
-    return view.memo(("actual",), lambda: view.result.master(view.result.mix)[1] if view.result.master_steps else None)
+    incremental.reading(view.key, "actual")
+
+    def compute():
+        with incremental.quiet():
+            return view.result.master(view.result.mix)[1] if view.result.master_steps else None
+    return view.memo(("actual",), compute)
 
 
 def m_true_peak(view, source, args):
@@ -1840,7 +1849,7 @@ def p_section_error_change(on, off, source, args):
     sections = on.ctx.recipe.get("sections")
     if not sections or not all("loudness_lu" in s for s in sections.values()):
         return None
-    a, b = (measure.sections(v.result.mix, v.rate, sections)["sections"] for v in (on, off))
+    a, b = (measure.sections(v.signal("mix"), v.rate, sections)["sections"] for v in (on, off))
     if any(a[n].get("error_lu") is None or b[n].get("error_lu") is None for n in a):
         return None
     changes = [abs(a[n]["error_lu"] - b[n]["error_lu"]) for n in a]
