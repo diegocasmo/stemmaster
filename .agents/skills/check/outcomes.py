@@ -130,6 +130,8 @@ class Context:
         self.roles = {name: {stem: source["role"] for stem in source.get("stems", [])} if source.get("chain") == "synths"
                       and source.get("role") else roles_of(source) for name, source in self.sources.items()}
         self.notes = {}
+        self.notes_read = []
+        self.notes_summary = {}
         self._windows = {}
         # Set while one record is read: its shared bus, if its steps act past its own node, and the recipe
         # (with the move on) whose routing decides where its dry and wet paths sum.
@@ -161,6 +163,8 @@ class Context:
 
     def source_notes(self, source):
         """Notes of each played stem, found on that stem itself (DIs are never used)."""
+        if source not in self.notes_read:
+            self.notes_read.append(source)
         if source not in self.notes:
             import soundfile
 

@@ -659,9 +659,13 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
                           sorted(variants.taps), variants.outside, ctx.times, ctx.target, master_mode)
         path = variants.cache / f"contract-{key}.json"
         if path.exists():
+            cached = json.loads(path.read_text())
+            for source, summary in cached.pop("notes").items():
+                ctx.notes_summary.setdefault(source, summary)
             # The key leaves out text, so text comes from the current record, never the cache.
-            out.append(json.loads(path.read_text()) | {"override": record.get("override")})
+            out.append(cached | {"override": record.get("override")})
             continue
+        ctx.notes_read = []
         compare = entry["contract"].get("compare")
         if compare == "alt" and "with" in keys:
             with_key = keys["with"]
@@ -715,7 +719,11 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode):
         result["read_at"] = ctx.acting
         ctx.acting = ctx.join_recipe = ctx.record = None
         ctx.trial_ids = []
-        path.write_text(json.dumps(result))
+        # The sources this record read, in first-read order, so a cache hit adds them to the report as a cold run would.
+        read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
+        for source, summary in read.items():
+            ctx.notes_summary.setdefault(source, summary)
+        path.write_text(json.dumps(result | {"notes": read}))
         out.append(result)
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
@@ -780,7 +788,7 @@ def report(recipe, song, nodes, master_mode=False):
             entry["off"] = variants.battery(off_key(recipe, record))
         records.append(entry)
     numbers = {"timing_stems": timing_stems, "hits": counts, "windows": windows_summary(ctx), "questions": intent_questions(recipe, song, ctx),
-               "notes": notes_summary(ctx), "current": current, "records": records, "contracts": contract}
+               "notes": ctx.notes_summary, "current": current, "records": records, "contracts": contract}
     (cache / "report.json").write_text(json.dumps(numbers, indent=1))
     (cache / "report.md").write_text(markdown(numbers))
     return cache / "report.md", numbers
@@ -821,8 +829,6 @@ def windows_summary(ctx):
     return out
 
 
-def notes_summary(ctx):
-    return {source: notes_tool_summary(found) for source, found in ctx.notes.items()}
 
 
 def notes_tool_summary(found):

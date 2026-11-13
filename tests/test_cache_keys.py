@@ -50,8 +50,6 @@ def check(song, monkeypatch):
 
 def by_record(numbers):
     found = copy.deepcopy(numbers)
-    # notes lists only the sources a contract read this run, so a full cache hit has none (issue #20).
-    found.pop("notes")
     for key in ("records", "contracts"):
         found[key] = sorted(found[key], key=lambda r: (r["move"], r["source"]))
     return found
@@ -133,3 +131,22 @@ def test_the_evidence_fingerprint_binds_settings_order():
     settings = {"threshold_db": -20, "ratio": 4}
 
     assert evidence.fingerprint(settings) != evidence.fingerprint(dict(reversed(settings.items())))
+
+
+def test_a_note_edit_gives_the_same_report_bytes(bass, song, check):
+    for name, seed in (("GtrL.wav", 3), ("GtrR.wav", 4)):
+        write(song, name, noise(1, seed=seed))
+    bass["stems"] |= {"GtrL.wav": {"bus": "guitars", "pan": -1}, "GtrR.wav": {"bus": "guitars", "pan": 1}}
+    bass["buses"]["guitars"] = {}
+    bass["sources"]["guitars"] = {"chain": "guitars", "stems": ["GtrL.wav", "GtrR.wav"]}
+    bass["moves"].append({"move": "guitars.align", "source": "guitars", "decision": "dropped", "steps": [], "fields": []})
+    report = song / "renders" / "check"
+    cold, _ = check(bass)
+    files = [(report / name).read_bytes() for name in ("report.json", "report.md")]
+    edit_notes(bass)
+
+    warm, renders = check(bass)
+
+    assert renders == 0
+    assert set(cold["notes"]) == {"bass", "guitars"}
+    assert [(report / name).read_bytes() for name in ("report.json", "report.md")] == files
