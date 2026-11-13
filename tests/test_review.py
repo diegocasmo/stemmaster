@@ -111,3 +111,134 @@ def test_codex_context_with_the_repo_agents_file_passes(transcripts, tmp_path, m
     head = f"# AGENTS.md instructions for {review.REPO}\n\n<INSTRUCTIONS>\n{agents}\n\n</INSTRUCTIONS>\n"
 
     assert transcripts(codex_entries=codex(environment=head + ENVIRONMENT)) == []
+
+
+def contract(move, source, value, state="review"):
+    return {"move": move, "source": source, "decision": "kept", "outcome": "kept", "fails": [],
+            "leaves": [{"id": "n1", "state": state, "value": value, "text": "is it audible?"}]}
+
+
+def song_snapshot(tmp_path, gate_threshold=-40, bass_value=2.0, stems="stems-a", base=None):
+    mix = {"stems": {"kick.wav": {"gain_db": 0}, "bass.wav": {"gain_db": -3}},
+           "steps": [{"id": "gate-kick", "target": "kick.wav", "plugin": "NoiseGate", "settings": {"threshold_db": gate_threshold}},
+                     {"id": "comp-bass", "target": "bass.wav", "plugin": "Compressor", "settings": {"ratio": 4}}],
+           "moves": [{"move": "kick.gate", "source": "kick", "decision": "kept", "steps": ["gate-kick"]},
+                     {"move": "bass.compress", "source": "bass", "decision": "kept", "steps": ["comp-bass"]}]}
+    numbers = {"current": {"mix": {"lufs": -10.0 + gate_threshold / 100}}, "records": [], "questions": {},
+               "contracts": [contract("kick.gate", "kick", gate_threshold / 10), contract("bass.compress", "bass", bass_value)]}
+    files = {".agents/skills/check/evidence.py": "e1", "docs/mixing-chains/kick.md": "k1"}
+    return review.snapshot(mix, ["code", stems, "plugins", None], files, tmp_path / "report.md", numbers, [], base)
+
+
+@pytest.fixture
+def reviews(tmp_path, monkeypatch):
+    """Writes a passing Claude and Codex transcript for a snapshot's prompt and its review entry."""
+    monkeypatch.setattr(review, "CLAUDE_PROJECTS", tmp_path / "claude")
+    monkeypatch.setattr(review, "CODEX_SESSIONS", tmp_path / "codex")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    recipe = {"reviews": []}
+
+    def add(snap, base=None):
+        snap["base"] = base and base["fingerprint"]
+        review.save_snapshot(tmp_path, snap)
+        text, asked = review.prompt_for(snap, base)
+        answer = {"verdict": "pass", "fingerprint": snap["fingerprint"], "report": review.report_digest(snap["numbers"]),
+                  "answers": {key: "measured, fine" for key in asked}}
+        reply = f"```json\n{json.dumps(answer)}\n```"
+        claude_id, codex_id = str(uuid.uuid4()), str(uuid.uuid4())
+        entry = lambda kind, content: {"type": kind, "sessionId": claude_id, "cwd": REPO, "message": {"content": content}}
+        path = tmp_path / "claude" / "project" / f"{claude_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e) for e in [entry("user", text), entry("assistant", [{"type": "text", "text": reply}])]))
+        message = lambda role, kind, body: {"type": "response_item", "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": body}]}}
+        path = tmp_path / "codex" / "2026" / f"rollout-1-{codex_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e) for e in [
+            {"type": "session_meta", "payload": {"id": codex_id, "cwd": REPO}}, {"type": "turn_context"},
+            message("user", "input_text", ENVIRONMENT), message("user", "input_text", text), message("assistant", "output_text", reply)]))
+        recipe["reviews"].append({"stage": "mix", "fingerprint": snap["fingerprint"], **({"base": snap["base"]} if base else {}),
+                                  "by": [{"agent": "claude", "session": claude_id}, {"agent": "codex", "session": codex_id}]})
+        return text
+
+    return recipe, add
+
+
+def test_a_scoped_review_asks_only_what_changed(tmp_path):
+    base, now = song_snapshot(tmp_path), song_snapshot(tmp_path, gate_threshold=-30)
+
+    found = review.scope(now, base)
+
+    assert list(found["moves"]) == ["kick.gate@kick"]
+    assert found["moves"]["kick.gate@kick"]["why"] == ["settings", "check"]
+    assert found["moves"]["kick.gate@kick"]["measured"] == ["n1: review -4.0 -> review -3.0"]
+    assert list(found["questions"]) == ["kick.gate@kick:n1"]
+    assert found["mix"] == ["mix.lufs: -10.4 -> -10.3"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda snap: snap["inputs"].__setitem__(1, "other stems"),
+    lambda snap: snap["files"].__setitem__("docs/mixing-chains/README.md", "r2"),
+    lambda snap: snap["inputs"].__setitem__(0, "other code"),
+], ids=["stems", "chain-readme", "code-not-named-file-by-file"])
+def test_some_changes_need_a_full_review(tmp_path, change):
+    now = song_snapshot(tmp_path, gate_threshold=-30)
+    change(now)
+
+    assert review.scope(now, song_snapshot(tmp_path)) is None
+
+
+def test_a_changed_chain_doc_puts_its_moves_in_scope(tmp_path):
+    now = song_snapshot(tmp_path)
+    now["files"]["docs/mixing-chains/kick.md"], now["inputs"][0] = "k2", "code2"
+
+    assert {key: change["why"] for key, change in review.scope(now, song_snapshot(tmp_path))["moves"].items()} == {"kick.gate@kick": ["doc"]}
+
+
+def test_a_scoped_review_on_a_passing_full_review_passes(tmp_path, reviews):
+    recipe, add = reviews
+    base = song_snapshot(tmp_path)
+    add(base)
+    now = song_snapshot(tmp_path, gate_threshold=-30)
+
+    assert review.passing_base(recipe, now, tmp_path)["fingerprint"] == base["fingerprint"]
+    text = add(now, base)
+    assert "bass.compress" not in text and f"Last passing review: {base['fingerprint']}" in text
+    assert review.verify_chain(recipe, now, tmp_path) == []
+
+
+def test_a_scoped_review_fails_when_its_base_no_longer_passes(tmp_path, reviews):
+    recipe, add = reviews
+    base = song_snapshot(tmp_path)
+    add(base)
+    now = song_snapshot(tmp_path, gate_threshold=-30)
+    add(now, base)
+    # Editing the base's numbers to hide a change makes both rebuilt prompts disagree with their transcripts.
+    snap = json.loads(review.snapshot_path(tmp_path, base["fingerprint"]).read_text())
+    snap["numbers"]["contracts"][1]["leaves"][0]["value"] = 9.0
+    review.snapshot_path(tmp_path, base["fingerprint"]).write_text(json.dumps(snap))
+
+    errors = review.verify_chain(recipe, now, tmp_path)
+
+    assert "mix review by claude: its first message is not the review prompt" in errors
+    assert f"review of {base['fingerprint']} (built on): mix review by claude: its first message is not the review prompt" in errors
+
+
+def test_a_scoped_review_needs_its_base_snapshot(tmp_path, reviews):
+    recipe, add = reviews
+    base = song_snapshot(tmp_path)
+    add(base)
+    now = song_snapshot(tmp_path, gate_threshold=-30)
+    add(now, base)
+    review.snapshot_path(tmp_path, base["fingerprint"]).unlink()
+
+    assert review.verify_chain(recipe, now, tmp_path) == [
+        f"the review of {now['fingerprint']} builds on {base['fingerprint']}, whose snapshot is missing or changed: review the mix in full"]
+
+
+def test_a_failed_review_is_no_base(tmp_path, reviews):
+    recipe, add = reviews
+    base = song_snapshot(tmp_path)
+    add(base)
+    recipe["reviews"][-1]["by"][0]["session"] = str(uuid.uuid4())
+
+    assert review.passing_base(recipe, song_snapshot(tmp_path, gate_threshold=-30), tmp_path) is None

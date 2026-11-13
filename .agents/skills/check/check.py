@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -6,7 +7,7 @@ import chains
 import contracts
 import review
 import structure
-from evidence import inputs, progress, render, report
+from evidence import CODE, ROOT, inputs, progress, render, report
 
 USAGE = "usage: uv run .agents/skills/check/check.py [--master | --review-prompt] [--no-report] songs/<id>/recipe.json"
 FLAGS = ("--master", "--no-report", "--review-prompt")
@@ -24,6 +25,12 @@ def structural(recipe, song, master):
     return nodes, errors, notes
 
 
+def code_files():
+    """Each file the fingerprint's code and docs hash covers, so a scoped review can name the ones that changed."""
+    docs = sorted((ROOT / "docs" / "mixing-chains").glob("*.md"))
+    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in CODE + docs}
+
+
 def mix_review(recipe, song):
     entries = [r for r in recipe.get("reviews", []) if r.get("stage") == "mix"]
     if not entries or "trial_master" not in entries[-1]:
@@ -33,14 +40,14 @@ def mix_review(recipe, song):
     nodes, errors, notes = structural(mix, song, False)
     if errors:
         return [f"the reviewed mix no longer checks: {error}" for error in errors]
-    fp = review.fingerprint(mix, inputs(song, mix))
-    if fp != entry.get("fingerprint"):
+    outside = inputs(song, mix)
+    if review.fingerprint(mix, outside) != entry.get("fingerprint"):
         return ["the mix changed after its review: review it again (check --review-prompt)"]
     path, numbers = report(mix, song, nodes)
     if any(c["fails"] for c in numbers["contracts"]):
         return ["the reviewed mix fails its own check"]
-    text = review.prompt(numbers, path, fp, notes)
-    return review.verify(recipe, fp, review.report_digest(numbers), review.sha(text), review.questions(numbers))
+    now = review.snapshot(mix, outside, code_files(), path, numbers, notes, entry.get("base"))
+    return review.verify_chain(recipe, now, path.parent)
 
 
 def main():
@@ -62,6 +69,7 @@ def main():
     if master and (errors := mix_review(recipe, song)):
         print("\n".join(f"fail: {error}" for error in errors))
         sys.exit(1)
+    reviewed = recipe
     if asking:
         # The prompt is built from the mix in the same form --master rebuilds it, so the two agree byte for byte.
         recipe = review.mix_part(recipe, review.trial_master(recipe))
@@ -78,10 +86,17 @@ def main():
     if fails:
         sys.exit(1)
     if asking:
-        fp = review.fingerprint(recipe, inputs(song, recipe))
-        prompt, digest = review.write_prompt(numbers, path, fp, notes, path.parent)
-        entry = {"stage": "mix", "fingerprint": fp, "trial_master": review.trial_master(recipe),
-                 "by": [{"agent": agent, "session": "<its session uuid>"} for agent in review.AGENTS]}
+        now = review.snapshot(recipe, inputs(song, recipe), code_files(), path, numbers, notes)
+        base = review.passing_base(reviewed, now, path.parent)
+        now["base"] = base and base["fingerprint"]
+        text, asked = review.prompt_for(now, base)
+        prompt, digest = review.write_prompt(text, path.parent)
+        review.save_snapshot(path.parent, now)
+        entry = {"stage": "mix", "fingerprint": now["fingerprint"], "trial_master": review.trial_master(recipe)}
+        if base:
+            entry["base"] = base["fingerprint"]
+            print(f"scoped on the passing review of {base['fingerprint']}: {len(asked)} of {len(review.questions(numbers))} questions")
+        entry["by"] = [{"agent": agent, "session": "<its session uuid>"} for agent in review.AGENTS]
         print(f"review prompt: {prompt} (sha256 {digest})")
         print("send it, unchanged, as the first message of one fresh Claude and one fresh Codex session, then add to reviews:")
         print(json.dumps(entry))

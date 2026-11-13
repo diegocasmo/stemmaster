@@ -83,11 +83,217 @@ def prompt(numbers, report_path, fp, notes):
     return "\n".join(lines) + "\n"
 
 
-def write_prompt(numbers, report_path, fp, notes, cache):
-    text = prompt(numbers, report_path, fp, notes)
+def write_prompt(text, cache):
     path = cache / "review-prompt.md"
     path.write_text(text)
     return path, sha(text)
+
+
+REPORTED = ("current", "records", "contracts", "questions")
+
+
+def snapshot(mix, outside, files, report_path, numbers, notes, base=None):
+    """What a review saw: enough to rebuild its prompt, and to list what a later mix changed."""
+    return {"fingerprint": fingerprint(mix, outside), "base": base, "mix": mix, "inputs": outside, "files": files,
+            "report": str(Path(report_path).resolve()), "numbers": {key: numbers.get(key) for key in REPORTED}, "notes": notes}
+
+
+def snapshot_path(cache, fp):
+    return cache / "reviews" / f"{fp}.json"
+
+
+def save_snapshot(cache, snap):
+    path = snapshot_path(cache, snap["fingerprint"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snap))
+    return path
+
+
+def load_snapshot(cache, fp):
+    """A snapshot whose recipe and inputs still hash to its fingerprint; its numbers are bound by the verdicts' report digest."""
+    try:
+        snap = json.loads(snapshot_path(cache, fp).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(snap, dict) or snap.get("fingerprint") != fp or fingerprint(snap.get("mix"), snap.get("inputs")) != fp:
+        return None
+    return snap
+
+
+def record_key(record, seen):
+    key = f"{record.get('move')}@{record.get('source')}"
+    seen[key] = seen.get(key, 0) + 1
+    return key if seen[key] == 1 else f"{key}#{seen[key]}"
+
+
+def keyed_records(mix):
+    seen = {}
+    return {record_key(r, seen): r for r in mix.get("moves", []) if isinstance(r, dict)}
+
+
+def field_value(mix, field):
+    kind, rest = field.split(".", 1)
+    entries = mix.get(kind, {}) if kind in ("stems", "buses") else {}
+    if ".sends." in rest:
+        name, bus = rest.split(".sends.", 1)
+        return [send for send in (entries.get(name) or {}).get("sends", []) if send.get("bus") == bus]
+    name, key = rest.rsplit(".", 1)
+    return (entries.get(name) or {}).get(key)
+
+
+def claimed(mix, record):
+    steps = {step.get("id"): step for step in mix.get("steps", [])}
+    return {"steps": [steps.get(step_id) for step_id in record.get("steps", [])],
+            "fields": {field: field_value(mix, field) for field in record.get("fields", []) if isinstance(field, str) and "." in field}}
+
+
+def flat(value, prefix=""):
+    if isinstance(value, dict) and value:
+        out = {}
+        for key, inner in value.items():
+            out |= flat(inner, f"{prefix}.{key}" if prefix else str(key))
+        return out
+    return {prefix: value}
+
+
+def shown(value):
+    return json.dumps(value, sort_keys=True)
+
+
+def leaf_changes(old, new):
+    old, new = old or {}, new or {}
+    lines = [f"{key}: {shown(old.get(key))} -> {shown(new.get(key))}"
+             for key in ("decision", "outcome", "needed", "worked", "fails", "engaged") if old.get(key) != new.get(key)]
+    old_leaves = {leaf["id"]: leaf for leaf in old.get("leaves", [])}
+    new_leaves = {leaf["id"]: leaf for leaf in new.get("leaves", [])}
+    show = lambda leaf: "absent" if leaf is None else f"{leaf.get('state')} {shown(leaf.get('value'))}"
+    return lines + [f"{leaf_id}: {show(old_leaves.get(leaf_id))} -> {show(new_leaves.get(leaf_id))}"
+                    for leaf_id in sorted(set(old_leaves) | set(new_leaves)) if old_leaves.get(leaf_id) != new_leaves.get(leaf_id)]
+
+
+def contract_index(numbers):
+    seen = {}
+    return {record_key(c, seen): c for c in numbers.get("contracts") or []}
+
+
+def scope(now, base):
+    """What changed from the reviewed mix `base` to `now`, or None when only a full review can judge it: changed stems,
+    plugins, profile or chain README, or a code change the snapshots can't name file by file."""
+    if base is None or now["inputs"][1:] != base["inputs"][1:] or now["report"] != base["report"]:
+        return None
+    files = sorted(path for path in set(now["files"]) | set(base["files"]) if now["files"].get(path) != base["files"].get(path))
+    if (now["inputs"][0] != base["inputs"][0]) != bool(files) or "docs/mixing-chains/README.md" in files:
+        return None
+    docs = {Path(path).stem for path in files if path.startswith("docs/mixing-chains/")}
+    mix, old = now["mix"], base["mix"]
+    records, old_records = keyed_records(mix), keyed_records(old)
+    contracts, old_contracts = contract_index(now["numbers"]), contract_index(base["numbers"])
+    moves = {}
+    for key, record in records.items():
+        why = []
+        if record != old_records.get(key):
+            why.append("recipe")
+        elif claimed(mix, record) != claimed(old, record):
+            why.append("settings")
+        if contracts.get(key) != old_contracts.get(key):
+            why.append("check")
+        if str(record.get("move", "")).split(".", 1)[0] in docs:
+            why.append("doc")
+        if why:
+            moves[key] = {"why": why, "measured": leaf_changes(old_contracts.get(key), contracts.get(key))}
+    rest = lambda recipe: flat({k: v for k, v in recipe.items() if k not in ("moves", "steps")})
+    after, before = rest(mix), rest(old)
+    steps = {s.get("id"): s for s in mix.get("steps", [])}
+    old_steps = {s.get("id"): s for s in old.get("steps", [])}
+    recipe = [f"{path}: {shown(before.get(path))} -> {shown(after.get(path))}"
+              for path in sorted(set(after) | set(before)) if after.get(path) != before.get(path)]
+    recipe += [f"steps.{step_id}: {shown(old_steps.get(step_id))} -> {shown(steps.get(step_id))}"
+               for step_id in sorted(set(steps) | set(old_steps), key=str) if steps.get(step_id) != old_steps.get(step_id)]
+    if [i for i in steps if i in old_steps] != [i for i in old_steps if i in steps]:
+        recipe.append(f"step order: {shown(list(old_steps))} -> {shown(list(steps))}")
+    current, old_current = flat(now["numbers"].get("current") or {}), flat(base["numbers"].get("current") or {})
+    mix_numbers = [f"{path}: {shown(old_current.get(path))} -> {shown(current.get(path))}"
+                   for path in sorted(set(current) | set(old_current)) if current.get(path) != old_current.get(path)]
+    asked, old_asked = questions(now["numbers"]), questions(base["numbers"])
+    return {"files": files, "recipe": recipe, "moves": moves, "removed": sorted(set(old_records) - set(records)),
+            "mix": mix_numbers, "questions": {k: v for k, v in asked.items() if old_asked.get(k) != v},
+            "notes": [note for note in now["notes"] if note not in base["notes"]]}
+
+
+def scoped_prompt(now, base, found):
+    """A review of only what changed since the passing review of `base`; it answers for the whole mix's fingerprint."""
+    contracts = contract_index(now["numbers"])
+    moves = []
+    for key, change in found["moves"].items():
+        entry = contracts.get(key) or {}
+        moves.append(f"- {key} ({', '.join(change['why'])} changed): decision {entry.get('decision')}, default outcome {entry.get('outcome')}")
+        moves += [f"  - {line}" for line in change["measured"]]
+    section = lambda title, lines: [title, *(lines or ["- none"]), ""]
+    lines = [
+        "You are an adversarial reviewer of one stemmaster mix. Judge it against docs/mixing-chains/ and the check report.",
+        "Read only this song's files. Do not edit the repo. Never post renders.",
+        f"Report: {now['report']}",
+        f"Mix fingerprint: {now['fingerprint']}",
+        f"Report digest: {report_digest(now['numbers'])}",
+        f"Last passing review: {base['fingerprint']}",
+        "",
+        "This review is scoped. Fresh Claude and Codex sessions passed the mix of the last passing review, and every move "
+        "not listed below has the same recipe entry, settings and check results as then. Judge what changed, and whether "
+        "any change breaks something that passed. Fail the mix if a change needs more than this list and the report to judge.",
+        "",
+        *section("Changed check code or chain docs:", [f"- {path}" for path in found["files"]]),
+        *section("Recipe changes (old -> new):", [f"- {line}" for line in found["recipe"]]),
+        *section("Changed moves (each has its own section in the report), with the check results that moved (old -> new):", moves),
+        *section("Removed moves:", [f"- {key}" for key in found["removed"]]),
+        *section("Mix and trial master numbers that moved (old -> new):", [f"- {line}" for line in found["mix"]]),
+        "Answer every question below from the report's numbers (and your own measurements if you need them):",
+        *[f"- {key}: {value}" for key, value in sorted(found["questions"].items())],
+        "",
+        "Also judge these reasons the recipe gives:",
+        *[f"- {note}" for note in found["notes"]],
+        "",
+        "End your final message with exactly one fenced json block and nothing after it:",
+        '```json\n{"verdict": "pass or fail", "fingerprint": "<the mix fingerprint>", "report": "<the report digest>", '
+        '"answers": {"<each question id>": "<your measured answer>"}}\n```',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def prompt_for(now, base):
+    """The prompt a review of `now` is sent and the questions it asks: scoped on `base` when given, else full."""
+    if base is None:
+        return prompt(now["numbers"], now["report"], now["fingerprint"], now["notes"]), questions(now["numbers"])
+    found = scope(now, base)
+    return scoped_prompt(now, base, found), found["questions"]
+
+
+def verify_chain(recipe, now, cache, seen=()):
+    """Verifies the review of `now` and, for a scoped one, each review it builds on down to a full one. Together they
+    answered every question the mix asks: a scoped prompt asks each one that is new or whose text changed."""
+    fp, base_fp = now["fingerprint"], now.get("base")
+    if base_fp is None:
+        text_now, asked = prompt_for(now, None)
+        return verify(recipe, fp, report_digest(now["numbers"]), sha(text_now), asked)
+    base = load_snapshot(cache, base_fp) if base_fp not in seen else None
+    if base is None:
+        return [f"the review of {fp} builds on {base_fp}, whose snapshot is missing or changed: review the mix in full"]
+    if scope(now, base) is None:
+        return [f"the review of {fp} builds on {base_fp}, but stems, plugins, profile or the chain README changed since: review the mix in full"]
+    text_now, asked = prompt_for(now, base)
+    errors = verify(recipe, fp, report_digest(now["numbers"]), sha(text_now), asked)
+    return errors + [f"review of {base_fp} (built on): {error}" for error in verify_chain(recipe, base, cache, {*seen, fp})]
+
+
+def passing_base(recipe, now, cache):
+    """The latest other reviewed mix whose reviews, down to a full one, still pass, and that a scoped review can build on."""
+    reviewed = [r.get("fingerprint") for r in recipe.get("reviews", []) if r.get("stage") == "mix"]
+    for fp in dict.fromkeys(reversed(reviewed)):
+        if fp == now["fingerprint"] or not isinstance(fp, str):
+            continue
+        base = load_snapshot(cache, fp)
+        if base is not None and scope(now, base) is not None and not verify_chain(recipe, base, cache):
+            return base
+    return None
 
 
 PASTED = re.compile(r'^\s*<pasted_content id="(\w+)">\n(.*)\n</pasted_content id="\1">\s*$', re.S)
