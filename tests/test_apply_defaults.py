@@ -78,10 +78,29 @@ def outcomes(numbers):
 
 
 def applied(song):
+    """The song's recipe with its defaults applied round by round until none changes, every change, and the last left."""
     recipe = song_recipe(song)
     _, numbers, variants = measure(recipe, song)
-    new, changes, left = defaults.decide(recipe, numbers, variants)
+    new, changes, left = recipe, [], []
+    for _ in range(4):
+        if changes:
+            _, round_numbers, round_variants = measure(new, song)
+        else:
+            round_numbers, round_variants = numbers, variants
+        new, more, left, _ = defaults.decide(new, round_numbers, round_variants)
+        if not more:
+            break
+        changes += more
     return recipe, numbers, new, changes, left
+
+
+def test_a_round_applies_one_change_per_source_and_defers_the_rest(song):
+    recipe = song_recipe(song)
+    _, numbers, variants = measure(recipe, song)
+    _, changes, _, deferred = defaults.decide(recipe, numbers, variants)
+    # kick.limit comes before kick.duck-bass in kick.md, and snare has a node of its own.
+    assert sorted(r["move"] for r, _ in changes) == ["kick.limit", "snare.hpf-lpf"]
+    assert [(r["move"], why) for r, why in deferred] == [("kick.duck-bass", "waits for a change before it in signal order")]
 
 
 APPLIED = {("kick.duck-bass", "kick"): "dropped", ("snare.hpf-lpf", "snare"): "dropped", ("kick.limit", "kick"): "kept"}
@@ -113,7 +132,8 @@ def test_only_the_decided_records_and_their_steps_change(song):
     recipe, _, new, changes, _ = applied(song)
     text = json.dumps(recipe, indent=2) + "\n"
     write = defaults.formatted(recipe, text)
-    changed = {i for i, r in enumerate(recipe["moves"]) if any(r is c for c, _ in changes)}
+    keys = {(c["move"], c["source"]) for c, _ in changes}
+    changed = {i for i, r in enumerate(recipe["moves"]) if (r["move"], r["source"]) in keys}
     assert new["moves"][2] == recipe["moves"][2]
     assert [s["id"] for s in new["steps"]] == ["snare-verb", "master-drive", "master-limit", "kick-lim"]
     assert new["moves"][1] == {"move": "kick.limit", "source": "kick", "decision": "kept", "note": "tried", "steps": ["kick-lim"]}
@@ -128,7 +148,7 @@ def test_only_the_decided_records_and_their_steps_change(song):
 def test_applying_twice_changes_nothing(song):
     _, _, new, _, _ = applied(song)
     _, numbers, variants = measure(new, song)
-    again, changes, _ = defaults.decide(new, numbers, variants)
+    again, changes, _, _ = defaults.decide(new, numbers, variants)
     assert changes == [] and json.dumps(again) == json.dumps(new)
 
 
@@ -157,7 +177,7 @@ def test_the_loop_writes_once_then_finds_a_fixed_point(song, monkeypatch, capsys
     monkeypatch.setattr(check, "structural", lambda r, s, m: (structure.nodes(r, structure.Routing(r), []), [], []))
     _, _, _, numbers = check.apply_defaults(path, recipe, song, False)
     out = capsys.readouterr().out
-    assert out.count("applied, round 1") == 3 and "round 2" not in out
+    assert out.count("applied, round 1") == 2 and out.count("applied, round 2") == 1 and "round 3" not in out
     assert "left: kick.compress on kick: default unresolved" in out
     written = path.read_text()
     assert {(c["move"], c["decision"]) for c in numbers["contracts"] if c["fails"]} == {("kick.compress", "dropped")}
@@ -192,7 +212,7 @@ def test_a_step_another_kept_record_claims_is_left_in_place():
     recipe = bare()
     numbers = {"contracts": [contract("toms.compress", "tom1", "kept", "dropped", needed="false"),
                              contract("toms.compress", "tom2", "kept", "kept")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes({}))
+    new, changes, left, _ = defaults.decide(recipe, numbers, Recipes({}))
     assert changes == [] and new == recipe
     assert "shares ['toms-comp'] with ['toms.compress on tom2']" in left[0][1]
 
@@ -200,7 +220,7 @@ def test_a_step_another_kept_record_claims_is_left_in_place():
 def test_a_step_every_claimant_drops_goes():
     recipe = bare()
     numbers = {"contracts": [contract("toms.compress", source, "kept", "dropped", needed="false") for source in ("tom1", "tom2")]}
-    new, changes, _ = defaults.decide(recipe, numbers, Recipes({}))
+    new, changes, _, _ = defaults.decide(recipe, numbers, Recipes({}))
     assert new["steps"] == [] and [r["decision"] for r in new["moves"]] == ["dropped", "dropped"] and len(changes) == 2
 
 
@@ -210,17 +230,65 @@ def test_two_trials_with_one_step_id_keep_only_the_first():
     trials = {source: dict(recipe, steps=recipe["steps"] + [step("gate", f"Tom{n}.wav", "NoiseGate", threshold_db=-40)])
               for n, source in ((1, "tom1"), (2, "tom2"))}
     numbers = {"contracts": [contract("toms.clean", source, "dropped", "kept", with_key=source) for source in ("tom1", "tom2")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes(trials))
+    new, changes, left, _ = defaults.decide(recipe, numbers, Recipes(trials))
     assert [s["id"] for s in new["steps"]] == ["toms-comp", "gate"] and new["steps"][1]["target"] == "Tom1.wav"
     assert len(changes) == 1 and "reuses names" in left[0][1]
 
 
-def test_a_record_whose_default_flips_after_it_was_applied_is_left_and_listed():
-    recipe = bare()
-    numbers = {"contracts": [contract("toms.compress", "tom1", "kept", "dropped", needed="false"),
-                             contract("toms.compress", "tom2", "kept", "kept")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes({}), frozen={("toms.compress", "tom1"): 1})
-    assert new == recipe and changes == [] and "flipped" in left[0][1] and "applied in round 1" in left[0][1]
+def chain_recipe():
+    """One tom with three kept moves on its own stem, a snare keying a Duck on the overheads, and a mix-bus move."""
+    steps = [step("t-comp", "Tom1.wav", "Compressor"), step("t-sat", "Tom1.wav", "Distortion"),
+             step("t-lim", "Tom1.wav", "Limiter"), step("s-eq", "Snare.wav", "PeakFilter"),
+             step("oh-duck", "OH.wav", "Duck", key="Snare.wav"), step("oh-eq", "OH.wav", "PeakFilter"),
+             step("mix-comp", "mix", "Compressor")]
+    moves = [("toms.limit", "tom1", "t-lim"), ("toms.compress", "tom1", "t-comp"), ("toms.saturate-clip", "tom1", "t-sat"),
+             ("snare.ring-cut", "snare", "s-eq"), ("overheads.snare-control", "cymbals", "oh-duck"),
+             ("overheads.hpf", "cymbals", "oh-eq"), ("mix-bus.compress", "mix-bus", "mix-comp")]
+    return {"stems": {"Tom1.wav": {}, "Snare.wav": {}, "OH.wav": {}}, "buses": {},
+            "sources": {"cymbals": {"chain": "overheads", "stems": ["OH.wav"]}, "tom1": {"chain": "toms", "stems": ["Tom1.wav"]},
+                        "snare": {"chain": "snare", "stems": ["Snare.wav"]}},
+            "steps": steps,
+            "moves": [{"move": move, "source": source, "decision": "kept", "steps": [step_id], "note": "n"}
+                      for move, source, step_id in moves]}
+
+
+def dropping(recipe, *keys):
+    return {"contracts": [contract(r["move"], r["source"], "kept", "dropped" if (r["move"], r["source"]) in keys else "kept",
+                                   needed="false") for r in recipe["moves"]]}
+
+
+def test_within_a_source_the_first_move_in_chain_order_changes_first():
+    recipe = chain_recipe()
+    numbers = dropping(recipe, ("toms.limit", "tom1"), ("toms.saturate-clip", "tom1"))
+    new, changes, _, deferred = defaults.decide(recipe, numbers, Recipes({}))
+    assert [r["move"] for r, _ in changes] == ["toms.saturate-clip"] and [r["move"] for r, _ in deferred] == ["toms.limit"]
+    assert [s["id"] for s in new["steps"]] == [s["id"] for s in recipe["steps"] if s["id"] != "t-sat"]
+
+
+def test_a_source_waits_while_the_source_keying_its_duck_changes():
+    recipe = chain_recipe()
+    numbers = dropping(recipe, ("snare.ring-cut", "snare"), ("overheads.hpf", "cymbals"))
+    _, changes, _, deferred = defaults.decide(recipe, numbers, Recipes({}))
+    assert [r["move"] for r, _ in changes] == ["snare.ring-cut"] and [r["move"] for r, _ in deferred] == ["overheads.hpf"]
+    # The overheads change on their own once the snare is settled.
+    _, changes, _, _ = defaults.decide(recipe, dropping(recipe, ("overheads.hpf", "cymbals")), Recipes({}))
+    assert [r["move"] for r, _ in changes] == ["overheads.hpf"]
+
+
+def test_a_higher_level_waits_for_a_lower_ones_changes():
+    recipe = chain_recipe()
+    numbers = dropping(recipe, ("mix-bus.compress", "mix-bus"), ("toms.limit", "tom1"))
+    _, changes, _, deferred = defaults.decide(recipe, numbers, Recipes({}))
+    assert [r["move"] for r, _ in changes] == ["toms.limit"]
+    assert [(r["move"], why) for r, why in deferred] == [("mix-bus.compress", "waits for a lower level's changes")]
+
+
+def test_a_change_that_cant_go_lets_the_next_in_order_go():
+    recipe = chain_recipe()
+    numbers = dropping(recipe, ("toms.compress", "tom1"), ("toms.limit", "tom1"))
+    broken = lambda r: ["broken"] if all(s["id"] != "t-comp" for s in r["steps"]) else []
+    _, changes, left, _ = defaults.decide(recipe, numbers, Recipes({}), validate=broken)
+    assert [r["move"] for r, _ in changes] == ["toms.limit"] and "broken" in left[0][1]
 
 
 def test_an_override_is_never_touched():
@@ -228,15 +296,28 @@ def test_an_override_is_never_touched():
     recipe["moves"][0]["override"] = {"reason": "r", "leaves": ["needed"]}
     numbers = {"contracts": [contract("toms.compress", "tom1", "kept", "dropped", needed="false"),
                              contract("toms.compress", "tom2", "kept", "kept")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes({}))
-    assert new == recipe and changes == [] and all(r["source"] != "tom1" for r, _ in left)
+    new, changes, left, _ = defaults.decide(recipe, numbers, Recipes({}))
+    assert new == recipe and changes == []
+    # The check fails it, so it is listed, as written, with what it cites.
+    assert [why for r, why in left if r["source"] == "tom1"] == ["its override is as written, citing ['needed']; contradicts; values: "]
+
+
+def test_a_stale_override_lists_what_it_cites_and_what_the_check_asks_for():
+    record = {"move": "snare.blend", "source": "snare", "override": {"reason": "r", "leaves": ["worked.1"]}}
+    c = {"fails": ["override must name the leaves it contradicts: ['worked.0.0', 'worked.1']"],
+         "leaves": [{"id": "needed", "state": "true", "value": 3.0, "test": "> 1"},
+                    {"id": "worked.0.0", "state": "true", "value": 0.0, "test": "<= 0.3"},
+                    {"id": "worked.1", "state": "true", "value": 0.547, "test": "> 0.5"}]}
+    assert defaults.override_report(record, c) == (
+        "its override is as written, citing ['worked.1']; override must name the leaves it contradicts: ['worked.0.0', "
+        "'worked.1']; values: worked.0.0 0.0 (<= 0.3), worked.1 0.547 (> 0.5)")
 
 
 def test_a_worked_if_failure_on_a_move_without_a_starting_trial_is_left():
     recipe = bare()
     numbers = {"contracts": [contract("toms.compress", "tom1", "kept", "dropped", worked="false"),
                              contract("toms.compress", "tom2", "kept", "kept")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes({}))
+    new, changes, left, _ = defaults.decide(recipe, numbers, Recipes({}))
     assert new == recipe and "Worked if fails" in left[0][1]
 
 
@@ -256,7 +337,7 @@ def test_a_kept_starting_trial_is_written_as_measured_even_from_the_cache(song, 
     # Forced: the point is what a kept starting trial writes, whatever this noise makes of it.
     for c in numbers["contracts"]:
         c["outcome"], c["fails"] = ("kept", ["contradicts"]) if c["move"] == move else (c["decision"], [])
-    new, changes, _ = defaults.decide(recipe, numbers, cached)
+    new, changes, _, _ = defaults.decide(recipe, numbers, cached)
     record = next(r for r in new["moves"] if r["move"] == move)
     assert record["steps"] == [s["id"] for s in trial["steps"] if s["id"].startswith(f"trial-{move.replace('.', '-')}")]
     if move == "bass.chorus":
@@ -319,7 +400,7 @@ def room_decide(song, extra):
 
 
 def test_dropping_the_last_send_to_a_return_removes_the_unfed_return(song):
-    recipe, (new, changes, left) = room_decide(song, extra=False)
+    recipe, (new, changes, left, _) = room_decide(song, extra=False)
     assert [r["move"] for r, _ in changes] == ["kick.hpf", "snare.reverb"] and left == []
     assert "snare-verb" not in new["buses"] and "sends" not in new["stems"]["Snare.wav"]
     assert check.renders(new, song, False) == []
@@ -330,7 +411,7 @@ def test_dropping_the_last_send_to_a_return_removes_the_unfed_return(song):
 
 
 def test_a_return_another_step_still_uses_is_left_and_the_rest_still_applies(song):
-    recipe, (new, changes, left) = room_decide(song, extra=True)
+    recipe, (new, changes, left, _) = room_decide(song, extra=True)
     assert [r["move"] for r, _ in changes] == ["kick.hpf"]
     assert [r["move"] for r, _ in left] == ["snare.reverb"] and "buses nothing feeds" in left[0][1]
     assert new["buses"] == recipe["buses"] and check.renders(new, song, False) == []
@@ -345,7 +426,7 @@ def test_a_dropped_blend_whose_default_is_kept_is_left_for_the_mixer(song):
     _, numbers, variants = measure(recipe, song)
     blend = outcomes(numbers)[("kick.blend", "kick")]
     assert (blend["outcome"], blend["with"]) == ("kept", "current")
-    new, changes, left = defaults.decide(recipe, numbers, variants)
+    new, changes, left, _ = defaults.decide(recipe, numbers, variants)
     assert next(r for r in new["moves"] if r["move"] == "kick.blend") == recipe["moves"][-1]
     assert any(r["move"] == "kick.blend" and "options already in the recipe" in why for r, why in left)
     assert any(r["move"] == "kick.limit" for r, _ in changes)
@@ -360,7 +441,7 @@ def test_a_chain_of_shared_claims_never_leaves_a_kept_record_on_a_removed_step()
     numbers = {"contracts": [contract("toms.compress", "a", "kept", "dropped", needed="false"),
                              contract("toms.compress", "b", "kept", "dropped", needed="false"),
                              contract("toms.compress", "c", "kept", "kept")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes({}))
+    new, changes, left, _ = defaults.decide(recipe, numbers, Recipes({}))
     assert new == recipe and changes == [] and sorted(r["source"] for r, why in left if "shares" in why) == ["a", "b"]
 
 
@@ -382,4 +463,4 @@ def test_a_round_lets_its_renders_go_before_the_next_starts(song, monkeypatch):
     monkeypatch.setattr(check, "measured", measured)
     check.apply_defaults(path, recipe, song, False)
     gc.collect()
-    assert len(rounds) == 2 and rounds[1] and all(rounds[1]) and all(ref() is None for ref in held)
+    assert len(rounds) == 3 and all(r and all(r) for r in rounds[1:]) and all(ref() is None for ref in held)
