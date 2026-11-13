@@ -46,8 +46,7 @@ def mix_review(recipe, song):
     path, numbers = report(mix, song, nodes)
     if any(c["fails"] for c in numbers["contracts"]):
         return ["the reviewed mix fails its own check"]
-    now = review.snapshot(mix, outside, code_files(), path, numbers, notes, entry.get("base"))
-    return review.verify_chain(recipe, now, path.parent)
+    return review.master_errors(recipe, review.snapshot(mix, outside, code_files(), path, numbers, notes))
 
 
 def main():
@@ -69,7 +68,6 @@ def main():
     if master and (errors := mix_review(recipe, song)):
         print("\n".join(f"fail: {error}" for error in errors))
         sys.exit(1)
-    reviewed = recipe
     if asking:
         # The prompt is built from the mix in the same form --master rebuilds it, so the two agree byte for byte.
         recipe = review.mix_part(recipe, review.trial_master(recipe))
@@ -87,17 +85,11 @@ def main():
         sys.exit(1)
     if asking:
         now = review.snapshot(recipe, inputs(song, recipe), code_files(), path, numbers, notes)
-        base, state = review.latest_base(reviewed, now, path.parent)
-        now["base"] = base and base["fingerprint"]
-        text, asked = review.prompt_for(now, base, state)
-        review.write_pack(numbers, now["fingerprint"], path)
+        text, asked, plan = review.plan_review(now)
         prompt, digest = review.write_prompt(text, path.parent)
-        review.save_snapshot(path.parent, now)
         entry = {"stage": "mix", "fingerprint": now["fingerprint"], "trial_master": review.trial_master(recipe)}
-        if base:
-            entry["base"] = base["fingerprint"]
-            print(f"scoped on the review of {base['fingerprint']} ({'passed' if state['passed'] else 'failed'}): "
-                  f"{len(asked)} ids to answer of {len(review.questions(numbers))} questions")
+        scope = f"scoped round {plan['round']} on review {plan['base']}" if plan["base"] else "full"
+        print(f"{scope}: {len(asked)} ids to answer, {len(plan['findings'])} open findings")
         entry["by"] = [{"agent": agent, "session": "<its session uuid>"} for agent in review.AGENTS]
         print(f"review prompt: {prompt} (sha256 {digest})")
         print("send it, unchanged, as the first message of one fresh Claude and one fresh Codex session, then add to reviews:")
