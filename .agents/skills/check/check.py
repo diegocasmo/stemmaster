@@ -1,3 +1,4 @@
+import gc
 import json
 import sys
 from pathlib import Path
@@ -7,7 +8,7 @@ import contracts
 import defaults
 import review
 import structure
-from evidence import inputs, measured, progress, render, report
+from evidence import inputs, measured, progress, release, render, report
 
 USAGE = "usage: uv run .agents/skills/check/check.py [--master | --review-prompt] [--no-report | --apply-defaults] songs/<id>/recipe.json"
 FLAGS = ("--master", "--no-report", "--review-prompt", "--apply-defaults")
@@ -51,33 +52,46 @@ def stop(errors, prefix=""):
     sys.exit(1)
 
 
+def renders(recipe, song, master):
+    """A recipe's structural errors, and the renderer's own refusal of it, as the check's strict render would refuse."""
+    try:
+        errors = structural(recipe, song, master)[1]
+        render.check(recipe, *render.timeline(recipe, song))
+    except SystemExit as error:
+        return [str(error)]
+    return errors
+
+
 def apply_defaults(path, recipe, song, master):
     """Writes each record's default outcome into the recipe, re-checking after each round until none changes."""
     write = defaults.formatted(recipe, path.read_text())
     if write is None:
         sys.exit(f"{path} isn't in the form the repo writes (json.dumps with indent=2 and a final newline); write it that way "
                  "first, so --apply-defaults changes only the records it decides")
-    frozen = set()
+    frozen = {}
     for round_ in range(1, MAX_ROUNDS + 2):
         nodes, errors, notes = structural(recipe, song, master)
         if errors or (master and (errors := mix_review(recipe, song))):
             stop(errors)
         report_path, numbers, variants = measured(recipe, song, nodes, master)
         # A reviewed mix stays as reviewed: with --master only the master moves take their defaults.
-        new, changes, left = defaults.decide(recipe, numbers, variants, frozen, master_only=master)
+        new, changes, left = defaults.decide(recipe, numbers, variants, frozen, master_only=master,
+                                             validate=lambda candidate: renders(candidate, song, master))
+        # The next round renders the whole song again, so this one's renders must be gone before it starts.
+        release(variants)
+        del variants
+        gc.collect()
         if not changes or round_ > MAX_ROUNDS:
             for record, why in left:
                 print(f"left: {defaults.label(record)}: {why}")
             if changes:
                 print(f"apply-defaults: stopped after {MAX_ROUNDS} rounds with {len(changes)} more defaults to apply; run it again")
             return nodes, notes, report_path, numbers
-        if errors := structural(new, song, master)[1]:
-            stop(errors, "with the defaults applied, not written: ")
         path.write_text(write(new))
         for record, what in changes:
             print(f"applied, round {round_}: {defaults.label(record)}: {what}")
         print(f"apply-defaults: wrote {path}; checking it again")
-        frozen |= {(record["move"], record["source"]) for record, _ in changes}
+        frozen |= {(record["move"], record["source"]): round_ for record, _ in changes}
         recipe = new
 
 

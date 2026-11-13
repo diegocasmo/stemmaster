@@ -434,6 +434,15 @@ class Variants:
         return view
 
 
+def release(variants):
+    """Lets a finished check's renders go: each view's twin points back at its Variants, a cycle that would keep them."""
+    for view in variants.views.values():
+        view.twin = None
+    variants.views.clear()
+    variants.batteries.clear()
+    variants.ctx = variants.memo = None
+
+
 def node_tap(ctx, source):
     # Without a drums bus there is no one place to try a drum-bus move: the first drum's node is not the kit.
     if source == "drum-bus":

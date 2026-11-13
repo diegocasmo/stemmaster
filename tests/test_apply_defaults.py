@@ -1,11 +1,14 @@
 import copy
+import gc
 import json
 import shutil
+import weakref
 
 import numpy as np
 import pytest
 import soundfile
 
+import chains
 import check
 import defaults
 import evidence
@@ -216,8 +219,8 @@ def test_a_record_whose_default_flips_after_it_was_applied_is_left_and_listed():
     recipe = bare()
     numbers = {"contracts": [contract("toms.compress", "tom1", "kept", "dropped", needed="false"),
                              contract("toms.compress", "tom2", "kept", "kept")]}
-    new, changes, left = defaults.decide(recipe, numbers, Recipes({}), frozen={("toms.compress", "tom1")})
-    assert new == recipe and changes == [] and "flipped" in left[0][1]
+    new, changes, left = defaults.decide(recipe, numbers, Recipes({}), frozen={("toms.compress", "tom1"): 1})
+    assert new == recipe and changes == [] and "flipped" in left[0][1] and "applied in round 1" in left[0][1]
 
 
 def test_an_override_is_never_touched():
@@ -267,3 +270,116 @@ def test_a_kept_starting_trial_is_written_as_measured_even_from_the_cache(song, 
         expected["stems"]["Bass.wav"]["sends"] = []
         expected["buses"][bus] = {}
     assert evidence.fingerprint(evidence.numeric(evidence.off_variant(new, record))) == evidence.fingerprint(evidence.numeric(expected))
+
+
+
+def room_song(song, extra=False):
+    """Kick, snare and a room mic, every move recorded: the room makes snare.reverb's Needed if false, so its default
+    drops the send that alone feeds its reverb return."""
+    for i, name in enumerate(("Kick.wav", "Snare.wav", "Room.wav")):
+        soundfile.write(song / "stems" / name, np.random.default_rng(i).normal(0, 0.03, (RATE, 2)), RATE, subtype="FLOAT")
+    recipe = {
+        "stems": {"Kick.wav": {"bus": "drums"}, "Snare.wav": {"bus": "drums", "sends": [{"bus": "snare-verb", "gain_db": -10}]},
+                  "Room.wav": {"bus": "drums"}},
+        "buses": {"drums": {}, "snare-verb": {"bus": "drums"}},
+        "sources": {"kick": {"chain": "kick", "stems": ["Kick.wav"]}, "snare": {"chain": "snare", "stems": ["Snare.wav"]},
+                    "room": {"chain": "overheads", "stems": ["Room.wav"]}},
+        "steps": [step("verb", "snare-verb", "Reverb", dry_level=0, room_size=0.3),
+                  step("kick-hpf", "Kick.wav", "HighpassFilter", cutoff_frequency_hz=30),
+                  dict(step("limit", "mix", "Limiter", threshold_db=-3), stage="master")],
+        "moves": [],
+    }
+    if extra:
+        recipe["steps"].insert(1, step("verb-eq", "snare-verb", "HighpassFilter", cutoff_frequency_hz=300))
+    docs = chains.parse()[0]
+    for source, chain in structure.instances(recipe):
+        if chain != "master":
+            recipe["moves"] += [{"move": move, "source": source, "decision": "dropped", "note": "n"}
+                                for move in structure.moves_for(recipe, source, chain, docs)]
+    claims = {"snare.reverb": (["verb"], ["stems.Snare.wav.sends.snare-verb"]), "mix-bus.trial-master": (["limit"], []),
+              "kick.hpf": (["kick-hpf"], []), "snare.hpf-lpf": (["verb-eq"] if extra else None, [])}
+    for record in recipe["moves"]:
+        if record["move"] in claims and claims[record["move"]][0]:
+            steps, fields = claims[record["move"]]
+            record.update(decision="kept", steps=steps, fields=fields, tool_reason="built-in stand-in")
+    return recipe
+
+
+def room_decide(song, extra):
+    recipe = room_song(song, extra)
+    (song / "renders" / "check").mkdir(parents=True)
+    assert check.renders(recipe, song, False) == []
+    nodes = structure.nodes(recipe, structure.Routing(recipe), [])
+    variants, ctx, _ = evidence.prepare(recipe, song, nodes, evidence.plan(recipe, song, nodes), ["apply-defaults-test"])
+    found = evidence.contract_report(recipe, song, nodes, variants, ctx, False, only={("snare.reverb", "snare")})
+    assert (found[0]["needed"], found[0]["outcome"]) == ("false", "dropped")
+    # kick.hpf stands in for any other record whose default can be applied.
+    found.append(contract("kick.hpf", "kick", "kept", "dropped", needed="false"))
+    return recipe, defaults.decide(recipe, {"contracts": found}, variants, validate=lambda r: check.renders(r, song, False))
+
+
+def test_dropping_the_last_send_to_a_return_removes_the_unfed_return(song):
+    recipe, (new, changes, left) = room_decide(song, extra=False)
+    assert [r["move"] for r, _ in changes] == ["kick.hpf", "snare.reverb"] and left == []
+    assert "snare-verb" not in new["buses"] and "sends" not in new["stems"]["Snare.wav"]
+    assert check.renders(new, song, False) == []
+    nodes = structure.nodes(new, structure.Routing(new), [])
+    variants, ctx, _ = evidence.prepare(new, song, nodes, evidence.plan(new, song, nodes), ["apply-defaults-test"])
+    again = evidence.contract_report(new, song, nodes, variants, ctx, False, only={("snare.reverb", "snare")})
+    assert (again[0]["decision"], again[0]["outcome"], again[0]["fails"]) == ("dropped", "dropped", [])
+
+
+def test_a_return_another_step_still_uses_is_left_and_the_rest_still_applies(song):
+    recipe, (new, changes, left) = room_decide(song, extra=True)
+    assert [r["move"] for r, _ in changes] == ["kick.hpf"]
+    assert [r["move"] for r, _ in left] == ["snare.reverb"] and "buses nothing feeds" in left[0][1]
+    assert new["buses"] == recipe["buses"] and check.renders(new, song, False) == []
+
+
+def test_a_dropped_blend_whose_default_is_kept_is_left_for_the_mixer(song):
+    recipe = song_recipe(song)
+    soundfile.write(song / "stems" / "Kick2.wav", hits(4, 0.25, 1, 5) * 0.7, RATE, subtype="FLOAT")
+    recipe["stems"]["Kick2.wav"] = {"bus": "drums"}
+    recipe["sources"]["kick"]["stems"].append("Kick2.wav")
+    recipe["moves"].append({"move": "kick.blend", "source": "kick", "decision": "dropped", "note": "n"})
+    _, numbers, variants = measure(recipe, song)
+    blend = outcomes(numbers)[("kick.blend", "kick")]
+    assert (blend["outcome"], blend["with"]) == ("kept", "current")
+    new, changes, left = defaults.decide(recipe, numbers, variants)
+    assert next(r for r in new["moves"] if r["move"] == "kick.blend") == recipe["moves"][-1]
+    assert any(r["move"] == "kick.blend" and "options already in the recipe" in why for r, why in left)
+    assert any(r["move"] == "kick.limit" for r, _ in changes)
+
+
+def test_a_chain_of_shared_claims_never_leaves_a_kept_record_on_a_removed_step():
+    recipe = {"stems": {"Tom1.wav": {}}, "buses": {},
+              "steps": [step("s1", "Tom1.wav", "Compressor"), step("s2", "Tom1.wav", "Compressor")],
+              "moves": [{"move": "toms.compress", "source": "a", "decision": "kept", "steps": ["s1"], "note": "a"},
+                        {"move": "toms.compress", "source": "b", "decision": "kept", "steps": ["s1", "s2"], "note": "b"},
+                        {"move": "toms.compress", "source": "c", "decision": "kept", "steps": ["s2"], "note": "c"}]}
+    numbers = {"contracts": [contract("toms.compress", "a", "kept", "dropped", needed="false"),
+                             contract("toms.compress", "b", "kept", "dropped", needed="false"),
+                             contract("toms.compress", "c", "kept", "kept")]}
+    new, changes, left = defaults.decide(recipe, numbers, Recipes({}))
+    assert new == recipe and changes == [] and sorted(r["source"] for r, why in left if "shares" in why) == ["a", "b"]
+
+
+def test_a_round_lets_its_renders_go_before_the_next_starts(song, monkeypatch):
+    recipe = song_recipe(song)
+    path = song / "recipe.json"
+    path.write_text(json.dumps(recipe, indent=2) + "\n")
+    monkeypatch.setattr(check, "structural", lambda r, s, m: (structure.nodes(r, structure.Routing(r), []), [], []))
+    monkeypatch.setattr(check, "renders", lambda r, s, m: [])
+    held, rounds = [], []
+
+    def measured(*args):
+        gc.collect()
+        rounds.append([ref() is None for ref in held])
+        out = evidence.measured(*args)
+        held[:] = [weakref.ref(view.result) for view in out[2].views.values()] + [weakref.ref(out[2].ctx)]
+        return out
+
+    monkeypatch.setattr(check, "measured", measured)
+    check.apply_defaults(path, recipe, song, False)
+    gc.collect()
+    assert len(rounds) == 2 and rounds[1] and all(rounds[1]) and all(ref() is None for ref in held)

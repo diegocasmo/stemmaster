@@ -85,55 +85,80 @@ def failing(c, part):
     return sorted(leaf["id"] for leaf in c["leaves"] if leaf["id"].startswith(part) and leaf["state"] == state)
 
 
-def decide(recipe, numbers, variants, frozen=(), master_only=False):
+def decide(recipe, numbers, variants, frozen=None, master_only=False, validate=None):
     """The recipe with each record's default outcome written in, what changed, and what was left and why.
 
-    Records with an override, and those in `frozen` (applied in an earlier round), are left as written.
+    Records with an override are left as written, and so are those in `frozen` ({(move, source): round} applied in an
+    earlier round). `validate(recipe)` lists a recipe's errors; a change that adds one is left out, so one record that
+    can't take its default never stops the rest.
     """
+    frozen = frozen or {}
     moves = recipe.get("moves", [])
     index = {(r.get("move"), r.get("source")): i for i, r in enumerate(moves)}
     keep, drop, left = [], [], []
+
+    def leave(record, why):
+        key = (record["move"], record["source"])
+        left.append((record, why + (f" (applied in round {frozen[key]})" if key in frozen else "")))
+
     for c in numbers["contracts"]:
         record = moves[index[(c["move"], c["source"])]]
         decision, computed = record.get("decision"), c["outcome"]
-        if "override" in record or (master_only and not c["move"].startswith("master.")):
+        if "override" in record:
+            continue
+        if master_only and not c["move"].startswith("master."):
+            if c["fails"]:
+                leave(record, "with --master only master moves take their defaults")
             continue
         contradicts = (decision in KEPT and computed == "dropped") or (decision == "dropped" and computed == "kept")
         if contradicts and (c["move"], c["source"]) in frozen:
-            left.append((record, f"its default flipped to {computed} after it was applied as {decision}; decide it by hand, "
-                                 "with an override giving the measured reason"))
+            leave(record, f"its default flipped to {computed} after it was applied as {decision}; decide it by hand, "
+                          "with an override giving the measured reason")
         elif decision in KEPT and computed == "dropped":
             if c["needed"] in NO_FAULT:
                 drop.append((record, "no fault found"))
             elif c["move"] in contracts.DEFAULT_TRIALS:
                 drop.append((record, f"its Worked if fails ({failing(c, 'worked')}); the check's own trial judges it from now on"))
             else:
-                left.append((record, f"its Worked if fails ({failing(c, 'worked')}); a dropped move with a fault keeps those "
-                                     "steps as its trial, and a failed trial needs an override naming those leaves"))
+                leave(record, f"its Worked if fails ({failing(c, 'worked')}); a dropped move with a fault keeps those "
+                              "steps as its trial, and a failed trial needs an override naming those leaves")
         elif decision == "dropped" and computed == "kept":
-            keep.append((record, c))
+            if c["with"] == "current":
+                leave(record, "its default is kept with the options already in the recipe; keep it by hand, claiming the "
+                              "fields that set them")
+            else:
+                keep.append((record, c))
         elif computed not in ("kept", "dropped"):
-            left.append((record, f"default {computed}"))
+            leave(record, f"default {computed}")
         elif c["fails"]:
-            left.append((record, "; ".join(c["fails"])))
+            leave(record, "; ".join(c["fails"]))
     out = copy.deepcopy(recipe)
+    known = set(validate(recipe)) if validate else set()
     changes = []
+
+    def valid(candidate, records):
+        new = sorted(set(validate(candidate)) - known) if validate else []
+        for record in records:
+            if new:
+                leave(record, f"not applied: with it the recipe fails: {new}")
+        return not new
+
     # Trials go in before any step is removed, so a step anchored on a removed one still lands where it was measured.
     for record, c in keep:
         variant = variants.recipes.get(c["with"])
         patch = trial_patch(recipe, variant) if variant is not None else None
-        if patch is None:
-            left.append((record, "its trial can't be written as recipe steps, buses, sends and routing"))
+        if not patch:
+            leave(record, "its trial can't be written as recipe steps, buses, sends and routing")
             continue
         taken = {step.get("id") for step in out.get("steps", [])}
         names = set(out["stems"]) | set(out.get("buses", {}))
         clash = sorted(({s["id"] for s in patch.get("steps", [])} & taken) | (set(patch.get("buses", {})) & names))
         if clash:
-            left.append((record, f"its trial reuses names another kept trial added: {clash}"))
+            leave(record, f"its trial reuses names another kept trial added: {clash}")
             continue
-        out = apply_patch(out, patch)
+        candidate = apply_patch(out, patch)
         steps, fields = claims_of(recipe, patch)
-        entry = out["moves"][index[(record["move"], record["source"])]]
+        entry = candidate["moves"][index[(record["move"], record["source"])]]
         entry.pop("trial", None)
         entry["decision"] = "kept"
         entry["steps"] = steps
@@ -141,30 +166,78 @@ def decide(recipe, numbers, variants, frozen=(), master_only=False):
             entry["fields"] = fields
         if off_tool(entry, patch) and not entry.get("tool_reason"):
             entry["tool_reason"] = TOOL_REASON
-        changes.append((record, f"kept: its trial worked; added steps {steps}" + (f" and {fields}" if fields else "")))
-    dropping = {(r["move"], r["source"]) for r, _ in drop}
-    for record, why in drop:
-        claims = set(record.get("steps", []) + record.get("fields", []))
-        others = [r for r in out["moves"] if (r.get("move"), r.get("source")) not in dropping
-                  and claims & set(r.get("steps", []) + r.get("fields", []))]
-        if others:
-            shared = sorted(claims & {c for r in others for c in r.get("steps", []) + r.get("fields", [])})
-            left.append((record, f"it shares {shared} with {[label(r) for r in others]}, which stay"))
-            continue
-        out = drop_claims(out, record)
-        entry = out["moves"][index[(record["move"], record["source"])]]
-        entry["decision"] = "dropped"
-        for key in ("steps", "fields"):
-            if key in entry:
-                entry[key] = []
-        what = [*record.get("steps", []), *record.get("fields", [])]
-        changes.append((record, f"dropped: {why}" + (f"; removed {what}" if what else "")))
+        if valid(candidate, [record]):
+            out = candidate
+            changes.append((record, f"kept: its trial worked; added steps {steps}" + (f" and {fields}" if fields else "")
+                            + "; its note is as written"))
+    for group in drop_groups(drop, out, leave):
+        candidate = out
+        for record, _ in group:
+            candidate = drop_claims(candidate, record)
+            entry = candidate["moves"][index[(record["move"], record["source"])]]
+            entry["decision"] = "dropped"
+            for key in ("steps", "fields"):
+                if key in entry:
+                    entry[key] = []
+        if valid(candidate, [record for record, _ in group]):
+            out = candidate
+            for record, why in group:
+                what = [*record.get("steps", []), *record.get("fields", [])]
+                changes.append((record, f"dropped: {why}" + (f"; removed {what}" if what else "") + "; its note is as written"))
     order = {id(r): i for i, r in enumerate(moves)}
     return out, sorted(changes, key=lambda c: order[id(c[0])]), sorted(left, key=lambda c: order[id(c[0])])
 
 
+def claims(record):
+    return set(record.get("steps", []) + record.get("fields", []))
+
+
+def drop_groups(drop, recipe, leave):
+    """The drops that can go, as groups sharing a claim, which go together or not at all.
+
+    A drop that shares a claim with a record that stays is left, and so, in turn, is any drop sharing a claim with it,
+    so no record that stays ever claims a removed step.
+    """
+    dropping = {(r["move"], r["source"]): (r, why) for r, why in drop}
+    staying = [r for r in recipe.get("moves", []) if (r.get("move"), r.get("source")) not in dropping]
+    changed = True
+    while changed:
+        changed = False
+        for key, (record, _) in list(dropping.items()):
+            shared = [r for r in staying if claims(record) & claims(r)]
+            if shared:
+                leave(record, f"it shares {sorted(claims(record) & set().union(*map(claims, shared)))} with "
+                              f"{[label(r) for r in shared]}, which stay")
+                staying.append(dropping.pop(key)[0])
+                changed = True
+    groups, seen = [], set()
+    for key in dropping:
+        if key in seen:
+            continue
+        group, todo = [], [key]
+        while todo:
+            current = todo.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            group.append(dropping[current])
+            todo += [k for k, (r, _) in dropping.items() if k not in seen and claims(r) & claims(dropping[current][0])]
+        groups.append(group)
+    return groups
+
+
+def fed(recipe):
+    entries = list(recipe["stems"].values()) + list(recipe.get("buses", {}).values())
+    return {settings.get("bus", "mix") for settings in entries} | {send["bus"] for settings in entries for send in settings.get("sends", [])}
+
+
 def drop_claims(recipe, record):
-    """The recipe as the check measured it without the record (its off variant), minus the empty sends lists that leaves."""
+    """The record's off variant, as the check measured it, without the empty sends lists and unfed returns that leaves.
+
+    A return the drop leaves unfed renders silence, and the renderer refuses an unfed bus in a song's own recipe, so it
+    goes when no step acts on it.
+    """
+    before = fed(recipe)
     out = evidence.off_variant(recipe, record)
     for field in record.get("fields", []):
         kind, rest = field.split(".", 1)
@@ -173,4 +246,8 @@ def drop_claims(recipe, record):
             entries = out["stems"] if kind == "stems" else out["buses"]
             if entries[name].get("sends") == []:
                 del entries[name]["sends"]
+    targets = {step["target"] for step in out.get("steps", [])}
+    while unfed := [bus for bus in out.get("buses", {}) if bus in before and bus not in fed(out) and bus not in targets]:
+        for bus in unfed:
+            del out["buses"][bus]
     return out
