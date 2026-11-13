@@ -4,12 +4,15 @@ from pathlib import Path
 
 import chains
 import contracts
+import defaults
 import review
 import structure
-from evidence import inputs, progress, render, report
+from evidence import inputs, measured, progress, render, report
 
-USAGE = "usage: uv run .agents/skills/check/check.py [--master | --review-prompt] [--no-report] songs/<id>/recipe.json"
-FLAGS = ("--master", "--no-report", "--review-prompt")
+USAGE = "usage: uv run .agents/skills/check/check.py [--master | --review-prompt] [--no-report | --apply-defaults] songs/<id>/recipe.json"
+FLAGS = ("--master", "--no-report", "--review-prompt", "--apply-defaults")
+# Each round can only change records no earlier round changed, so this bounds a chain of knock-on defaults.
+MAX_ROUNDS = 3
 
 
 def structural(recipe, song, master):
@@ -43,14 +46,55 @@ def mix_review(recipe, song):
     return review.verify(recipe, fp, review.report_digest(numbers), review.sha(text), review.questions(numbers))
 
 
+def stop(errors, prefix=""):
+    print("\n".join(f"fail: {prefix}{error}" for error in errors))
+    sys.exit(1)
+
+
+def apply_defaults(path, recipe, song, master):
+    """Writes each record's default outcome into the recipe, re-checking after each round until none changes."""
+    write = defaults.formatted(recipe, path.read_text())
+    if write is None:
+        sys.exit(f"{path} isn't in the form the repo writes (json.dumps with indent=2 and a final newline); write it that way "
+                 "first, so --apply-defaults changes only the records it decides")
+    frozen = set()
+    for round_ in range(1, MAX_ROUNDS + 2):
+        nodes, errors, notes = structural(recipe, song, master)
+        if errors or (master and (errors := mix_review(recipe, song))):
+            stop(errors)
+        report_path, numbers, variants = measured(recipe, song, nodes, master)
+        # A reviewed mix stays as reviewed: with --master only the master moves take their defaults.
+        new, changes, left = defaults.decide(recipe, numbers, variants, frozen, master_only=master)
+        if not changes or round_ > MAX_ROUNDS:
+            for record, why in left:
+                print(f"left: {defaults.label(record)}: {why}")
+            if changes:
+                print(f"apply-defaults: stopped after {MAX_ROUNDS} rounds with {len(changes)} more defaults to apply; run it again")
+            return nodes, notes, report_path, numbers
+        if errors := structural(new, song, master)[1]:
+            stop(errors, "with the defaults applied, not written: ")
+        path.write_text(write(new))
+        for record, what in changes:
+            print(f"applied, round {round_}: {defaults.label(record)}: {what}")
+        print(f"apply-defaults: wrote {path}; checking it again")
+        frozen |= {(record["move"], record["source"]) for record, _ in changes}
+        recipe = new
+
+
 def main():
     args = sys.argv[1:]
-    master, skip_report, asking = (flag in args for flag in FLAGS)
+    master, skip_report, asking, applying = (flag in args for flag in FLAGS)
     args = [arg for arg in args if arg not in FLAGS]
-    if len(args) != 1 or (master and asking):
+    if len(args) != 1 or (master and asking) or (applying and (asking or skip_report)):
         sys.exit(USAGE)
     path = Path(args[0])
     recipe, song = json.loads(path.read_text()), path.parent
+    if applying:
+        nodes, notes, path, numbers = apply_defaults(path, recipe, song, master)
+        for note in notes:
+            print(f"review: {note}")
+        finish(path, numbers)
+        return
     nodes, errors, notes = structural(recipe, song, master)
     for note in notes:
         print(f"review: {note}")
@@ -70,13 +114,7 @@ def main():
             print("\n".join(f"fail: the mix without its master moves: {error}" for error in errors))
             sys.exit(1)
     path, numbers = report(recipe, song, nodes, master)
-    fails = [f"{c['move']} on {c['source']}: {fail}" for c in numbers["contracts"] for fail in c["fails"]]
-    for key, text in sorted(review.questions(numbers).items()):
-        print(f"review: {key}: {text}")
-    print("\n".join(f"fail: {fail}" for fail in fails))
-    print(path)
-    if fails:
-        sys.exit(1)
+    finish(path, numbers)
     if asking:
         fp = review.fingerprint(recipe, inputs(song, recipe))
         prompt, digest = review.write_prompt(numbers, path, fp, notes, path.parent)
@@ -85,6 +123,16 @@ def main():
         print(f"review prompt: {prompt} (sha256 {digest})")
         print("send it, unchanged, as the first message of one fresh Claude and one fresh Codex session, then add to reviews:")
         print(json.dumps(entry))
+
+
+def finish(path, numbers):
+    fails = [f"{c['move']} on {c['source']}: {fail}" for c in numbers["contracts"] for fail in c["fails"]]
+    for key, text in sorted(review.questions(numbers).items()):
+        print(f"review: {key}: {text}")
+    print("\n".join(f"fail: {fail}" for fail in fails))
+    print(path)
+    if fails:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

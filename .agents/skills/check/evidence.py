@@ -483,6 +483,17 @@ def unique_tag(recipe, base):
     return tag
 
 
+def match_db(recipes, key, match_id):
+    step = next((s for s in recipes[key]["steps"] if s["id"] == match_id), None) if match_id else None
+    return step["settings"]["gain_db"] if step else None
+
+
+def set_match(recipes, key, match_id, gain_db):
+    step = next((s for s in recipes[key]["steps"] if s["id"] == match_id), None) if match_id and gain_db is not None else None
+    if step:
+        step["settings"]["gain_db"] = gain_db
+
+
 def match_trial(variants, key, target, match_id):
     variant = variants.recipes[key]
     gain = next((step for step in variant["steps"] if step["id"] == match_id), None)
@@ -756,6 +767,8 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
             cached = json.loads(path.read_text())
             for source, summary in cached.pop("notes").items():
                 ctx.notes_summary.setdefault(source, summary)
+            # --apply-defaults writes the trial as measured, so a cache hit must leave its matched gain in the variant too.
+            set_match(variants.recipes, keys.get("with"), entry.get("match"), cached.pop("match_db", None))
             # The key leaves out text, so text comes from the current record, never the cache.
             out.append(cached | {"override": record.get("override")})
             continue
@@ -817,7 +830,7 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
         read = {source: notes_tool_summary(ctx.notes[source]) for source in ctx.notes_read}
         for source, summary in read.items():
             ctx.notes_summary.setdefault(source, summary)
-        write_atomic(path, json.dumps(result | {"notes": read}))
+        write_atomic(path, json.dumps(result | {"notes": read, "match_db": match_db(variants.recipes, keys.get("with"), entry.get("match"))}))
         out.append(result)
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
@@ -881,6 +894,11 @@ def prepare(recipe, song, nodes, planned, outside):
 
 
 def report(recipe, song, nodes, master_mode=False):
+    return measured(recipe, song, nodes, master_mode)[:2]
+
+
+def measured(recipe, song, nodes, master_mode=False):
+    """The report, and the variants it judged each record on (a kept default reads its trial from them)."""
     cache = song / "renders" / "check"
     cache.mkdir(parents=True, exist_ok=True)
     planned = plan(recipe, song, nodes)
@@ -899,7 +917,7 @@ def report(recipe, song, nodes, master_mode=False):
                "notes": source_order(recipe, ctx.notes_summary), "current": current, "records": records, "contracts": contract}
     (cache / "report.json").write_text(json.dumps(numbers, indent=1))
     (cache / "report.md").write_text(markdown(numbers))
-    return cache / "report.md", numbers
+    return cache / "report.md", numbers, variants
 
 
 def intent_questions(recipe, song, ctx):
