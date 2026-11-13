@@ -126,7 +126,9 @@ def runs_source(module):
 CODE = code_digest(Path(__file__).with_name(name) for name in ("render.py", "native.py", "airwindows.py")) \
     if all(runs_source(module) for module in (sys.modules[__name__], native, airwindows)) else None
 # Only names the memo writes are ever evicted, so a folder shared with other files keeps them.
-MEMO_NAME = re.compile(r"([0-9a-f]{16})-[0-9a-f]{64}(\.npy|\.\d+\.tmp)")
+MEMO_NAME = re.compile(r"([0-9a-f]{16})-[0-9a-f]{64}(\.npy|\.seen|\.\d+\.tmp)")
+# What an empty file takes on disk, so seen markers count toward the cap.
+MEMO_BLOCK_BYTES = 4096
 
 
 def memo_folder():
@@ -164,10 +166,12 @@ class Memo:
     mtime is its last use. Past the byte cap, files of other code unused for a day go first, then the least recently used.
     """
 
-    def __init__(self, folder, cap_bytes=MEMO_BYTES):
+    def __init__(self, folder, cap_bytes=MEMO_BYTES, sightings=2):
         if CODE is None:
             raise RuntimeError("a .pyc of render.py, native.py or airwindows.py holds other code than its source")
-        self.folder, self.cap = Path(folder), cap_bytes
+        # Most outputs are computed once and never asked for again, so one is stored only on its `sightings`th
+        # computation; an empty .seen file remembers the first, across runs too.
+        self.folder, self.cap, self.sightings = Path(folder), cap_bytes, sightings
         self.folder.mkdir(parents=True, exist_ok=True)
         self.bundles = {}
         self.ran = self.reused = 0
@@ -231,6 +235,11 @@ class Memo:
         try:
             if size > self.cap or shutil.disk_usage(self.folder).free < size + MEMO_SPARE_BYTES:
                 return
+            seen = path.with_suffix(".seen")
+            if self.sightings > 1 and not seen.exists():
+                seen.touch()
+                self.evict()
+                return
             content = hashlib.sha256(header)
             content.update(layout(audio))
             with open(temp, "wb") as file:
@@ -258,7 +267,7 @@ class Memo:
                     used = stat.st_mtime_ns if stat.st_mtime_ns <= now else 0
                     tag = name[1]
                     newest[tag] = max(newest.get(tag, 0), used)
-                    files.append((tag, used, stat.st_size, entry.path))
+                    files.append((tag, used, MEMO_BLOCK_BYTES if name[2] == ".seen" else stat.st_size, entry.path))
             except OSError:
                 pass
         # Another worktree's check may be running now, so its files are stale only once it has written nothing for a day.

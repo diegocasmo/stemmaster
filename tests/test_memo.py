@@ -65,8 +65,9 @@ def stems(song):
     return song
 
 
-def nodes(song, cap=render.MEMO_BYTES):
-    return render.Memo(song / "renders" / "check" / "nodes", cap)
+def nodes(song, cap=render.MEMO_BYTES, sightings=1):
+    """Stores on first sight unless told otherwise, so most tests show reuse in two renders, not three."""
+    return render.Memo(song / "renders" / "check" / "nodes", cap, sightings)
 
 
 def stored(memo):
@@ -119,9 +120,10 @@ def outputs(recipe, song, memo, probes=("k-comp", "b-comp", "b-duck", "g-ride"))
     }
 
 
+@pytest.mark.parametrize("sightings", [1, 2])
 @pytest.mark.parametrize("cap", [render.MEMO_BYTES, 3 * RATE * 2 * 8, 0])
-def test_every_output_is_byte_identical_with_and_without_the_memo(stems, cap):
-    memo = nodes(stems, cap)
+def test_every_output_is_byte_identical_with_and_without_the_memo(stems, cap, sightings):
+    memo = nodes(stems, cap, sightings)
     for recipe in variants():
         assert outputs(recipe, stems, memo) == outputs(recipe, stems, None)
         assert stored(memo) <= cap
@@ -647,12 +649,12 @@ def test_foreign_files_in_the_memo_folder_survive_eviction(tmp_path):
     folder = tmp_path / "nodes"
     folder.mkdir()
     foreign = ["measurements.npy", "editor.tmp", "0123456789abcdef-short.npy", f"{'A' * 16}-{K['a']}.npy",
-               f"{'0' * 16}-{K['a']}.npy.bak", f"{'0' * 16}-{K['a']}.x.tmp"]
+               f"{'0' * 16}-{K['a']}.npy.bak", f"{'0' * 16}-{K['a']}.x.tmp", "notes.seen", f"{'A' * 16}-{K['a']}.seen"]
     for name in foreign:
         np.save(folder / "data.npy", AUDIO)
         (folder / "data.npy").rename(folder / name)
         days_ago(folder / name, 3)
-    memo = render.Memo(folder, FILE)
+    memo = render.Memo(folder, FILE, sightings=1)
     memo.put(K["a"], AUDIO)
     memo.put(K["b"], AUDIO)
     assert sorted(path.name for path in folder.iterdir()) == sorted(foreign + [memo.path(K["b"]).name])
@@ -715,3 +717,23 @@ def test_a_stale_pyc_turns_the_memo_off(tmp_path):
     assert imported() == ["10", "True"]
     os.unlink(importlib.util.cache_from_source(str(native)))
     assert imported() == ["20", "False"]
+
+
+
+def test_an_output_is_stored_on_its_second_computation_and_reused_on_its_third(stems):
+    suffixes = []
+    for ran, reused in ((MIX_STEPS, 0), (MIX_STEPS, 0), (0, MIX_STEPS)):
+        memo = nodes(stems, sightings=2)
+        assert outputs(song_recipe(), stems, memo) == outputs(song_recipe(), stems, None)
+        assert (memo.ran, memo.reused) == (ran, reused)
+        suffixes.append(sorted({path.suffix for path in memo.folder.iterdir()}))
+    assert suffixes == [[".seen"], [".npy", ".seen"], [".npy", ".seen"]]
+
+
+def test_seen_markers_count_toward_the_cap_and_go_least_recently_used_first(tmp_path):
+    memo = render.Memo(tmp_path, 2 * render.MEMO_BLOCK_BYTES)
+    for key in "abc":
+        memo.put(K[key], AUDIO)
+    assert kept(memo) == ["b.seen", "c.seen"]
+    memo.put(K["a"], AUDIO)
+    assert memo.get(K["a"]) is None and kept(memo) == ["a.seen", "c.seen"]
