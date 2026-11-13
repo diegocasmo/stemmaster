@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pyloudnorm
 import soundfile
+from scipy import signal
 
 ROOT = Path(__file__).resolve().parents[3]
 for skill in ("render", "analyze"):
@@ -136,12 +137,54 @@ def placed_stem(recipe, song, stem, length):
     return render.place(audio, recipe["stems"][stem].get("offset_samples", 0), length)
 
 
+# A stick attack shows above 1 kHz; a tom's ring, even two modes beating, stays below it.
+TOM_BANDS_HZ = [1000, 2000, 4000, 8000]
+# Another tom's own onset from this long before one in this mic to SAME_HIT_MS after (rolls, flams, a late bleed path)
+# leaves it that tom's, as the louder mic always did.
+RECENT_HIT_MS = 50
+# Ends this far before the onset: a hit can start a few ms before the onset found on another mic, and onsets are found
+# up to ~10 ms into a hit that rises from a ring.
+BEFORE_GAP_MS, BEFORE_SPAN_MS = 10, 20
+# Long enough for the lowest band's filter to settle from silence.
+WARM_MS = 100
+
+
+def onset_bands(audio, rate, onsets):
+    """Per band, each onset's quietest level before it (in the 20 ms ending 10 ms before, so a roll's last stroke
+    can't hide the next attack) and its loudest from then to the end of the attack, in dB. The filters are causal, so a
+    hit's energy never shows before it; an onset too near the start to have a before reads silence there. Each onset
+    filters only its own stretch, from WARM_MS before the before."""
+    gap, span = round(BEFORE_GAP_MS / 1000 * rate), round(BEFORE_SPAN_MS / 1000 * rate)
+    reach, warm = round(hit_tools.ATTACK_MS[1] / 1000 * rate), round(WARM_MS / 1000 * rate)
+    before, after = np.full((len(TOM_BANDS_HZ), len(onsets)), -200.0), np.full((len(TOM_BANDS_HZ), len(onsets)), -200.0)
+    for band, center in enumerate(TOM_BANDS_HZ):
+        low, high = center / np.sqrt(2), min(center * np.sqrt(2), rate / 2 * 0.99)
+        if low >= high:
+            continue
+        sos = signal.butter(2, [low, high], "bandpass", fs=rate, output="sos")
+        for index, t in enumerate(onsets):
+            start = max(0, t - gap - span - warm)
+            level = hit_tools.envelope_db((signal.sosfilt(sos, audio[start : t + reach], axis=0) ** 2).sum(axis=1), rate)
+            if t - gap > 0:
+                before[band, index] = level[max(0, t - gap - span) - start : t - gap - start].min(initial=200)
+            after[band, index] = level[max(0, t - gap) - start :].max(initial=-200)
+    return before, after
+
+
+def struck(mic, other):
+    """Whether `mic` has a new stick attack at each onset: some band above 1 kHz rises over 6 dB above its level just
+    before, by more power than `other` gains there. The same rise in the other mic is that mic's own hit bleeding in."""
+    gain = lambda bands: 10 ** (bands[1] / 10) - 10 ** (bands[0] / 10)
+    return ((mic[1] - mic[0] > OWN_HIT_DB) & (gain(mic) > gain(other))).any(axis=0)
+
+
 def own_tom_hits(recipe, song, sources, times, stem, onsets, rate, length):
     """A tom mic's onsets that are the tom, not the rest of the kit it also hears.
 
     At every hit of another drum the tom mic sits a near fixed level under each of that drum's mics, so an onset on
-    such a hit is kept only when it is at least 6 dB louder than that bleed predicts. A tom's own hit is loudest in its
-    own mic of all the tom mics, and close to the cymbal mics: kit bleed sits 6 dB or more under them.
+    such a hit is kept only when it is at least 6 dB louder than that bleed predicts. Another tom mic louder at the onset
+    takes it only when that tom was hit there too, not when it still rings from an earlier hit. A tom's own hit is close
+    to the cymbal mics: kit bleed sits 6 dB or more under them.
     """
     tom = placed_stem(recipe, song, stem, length)
     keep = np.ones(len(onsets), dtype=bool)
@@ -155,7 +198,17 @@ def own_tom_hits(recipe, song, sources, times, stem, onsets, rate, length):
             other = placed_stem(recipe, song, mic, length)
             there = hit_tools.measure(other, rate, onsets)["level_db"]
             if source.get("chain") == "toms":
-                keep &= ~(there > here)
+                # A louder tom mic owns the onset only if it was hit there: an onset of its own just before, or a new
+                # stick attack. In a fill the last tom only rings, louder than the next tom's hit.
+                louder = there > here
+                own = np.asarray(times.get(name, []))
+                recent = np.array([bool(((own <= t + SAME_HIT_MS / 1000 * rate) & (own >= t - RECENT_HIT_MS / 1000 * rate)).any())
+                                   for t in onsets], dtype=bool)
+                check = np.flatnonzero(louder & ~recent)
+                vetoed = louder & recent
+                if len(check):
+                    vetoed[check] = struck(onset_bands(other, rate, onsets[check]), onset_bands(tom, rate, onsets[check]))
+                keep &= ~vetoed
                 continue
             if source.get("chain") == "overheads":
                 keep &= ~(there >= here + OWN_HIT_DB)
