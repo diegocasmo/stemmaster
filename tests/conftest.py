@@ -13,3 +13,9 @@ def song(tmp_path):
     """A song folder whose stems the test writes from arrays."""
     (tmp_path / "stems").mkdir()
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def one_process(monkeypatch):
+    """Tests count renders in this process, so the check runs here unless a test asks for workers."""
+    monkeypatch.setenv("STEMMASTER_CHECK_WORKERS", "1")
