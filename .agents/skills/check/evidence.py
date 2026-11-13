@@ -349,7 +349,9 @@ class Variants:
         self.battery_path(key).write_text(json.dumps(numbers))
         self.batteries[key] = numbers
         view = outcome_tools.View(self.ctx, result, master, variant)
-        view.probed = result.mixer.probed
+        # A copy: a later master render (a contract reading the actual master) writes its probes into the mixer, and
+        # every contract must read the same matched-drive probes whatever order the contracts run in.
+        view.probed = dict(result.mixer.probed)
         view.twin = lambda other: self.view(self.add(recipe_key(other), other))
         self.views[key] = view
         RENDERS[0] += 1

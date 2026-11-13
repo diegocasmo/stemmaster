@@ -1,5 +1,6 @@
 import copy
 import json
+import shutil
 
 import pytest
 
@@ -150,6 +151,58 @@ def test_a_note_edit_gives_the_same_report_bytes(bass, song, check):
     assert renders == 0
     assert list(cold["notes"]) == ["bass", "guitars"]
     assert [(report / name).read_bytes() for name in ("report.json", "report.md")] == files
+
+
+def master_recipe(profile, first):
+    """A master Compressor before a Limiter, with step ids that make the contract named `first` run first."""
+    for index in range(100):
+        recipe = {
+            "profile": str(profile),
+            "stems": {"Noise.wav": {}},
+            "sources": {},
+            "steps": [
+                {"id": f"comp{index}", "target": "mix", "stage": "master", "plugin": "Compressor",
+                 "settings": {"threshold_db": -20, "ratio": 4, "attack_ms": 1, "release_ms": 30}},
+                {"id": f"limit{index}", "target": "mix", "stage": "master", "plugin": "Limiter",
+                 "settings": {"threshold_db": -1, "release_ms": 100}},
+            ],
+            "moves": [
+                {"move": "master.compress", "source": "master", "decision": "kept", "steps": [f"comp{index}"], "fields": []},
+                {"move": "master.limit", "source": "master", "decision": "kept", "steps": [f"limit{index}"], "fields": []},
+            ],
+        }
+        if min(recipe["moves"], key=lambda record: evidence.off_key(recipe, record))["move"] == first:
+            return recipe
+    raise AssertionError(f"no step ids put {first} first")
+
+
+@pytest.mark.parametrize("first", ["master.limit", "master.compress"])
+def test_master_probes_do_not_depend_on_contract_order_or_the_cache(song, first):
+    write(song, "Noise.wav", noise(1, seed=11) * 0.1)
+    profile = song / "target"
+    profile.mkdir()
+    reference = {field: -12 for field in evidence.measure.PROFILE_WHOLE_FIELDS + evidence.measure.PROFILE_LOUD_FIELDS}
+    reference["bands_db"] = {str(band): -20 for band in evidence.outcome_tools.BAND_CENTERS_HZ}
+    (profile / "profile.json").write_text(json.dumps({"sample_rate": 48000, "master_integrated_lufs": -12,
+                                                      "references": [reference] * 3}))
+    recipe = master_recipe(profile, first)
+    cache = song / "renders" / "check"
+
+    def compressor():
+        numbers = evidence.report(copy.deepcopy(recipe), song, {}, master_mode=True)[1]
+        found = next(c for c in numbers["contracts"] if c["move"] == "master.compress")
+        return list(found["engaged"].values()), found["fails"], [(cache / n).read_bytes() for n in ("report.json", "report.md")]
+
+    cold = compressor()
+    recipe["moves"][0]["override"] = {"reason": "measured", "leaves": []}
+    partial = compressor()
+    shutil.rmtree(cache)
+    cold_override = compressor()
+
+    # At the matched drive the compressor works; at the quiet actual drive it reads as idle (about -150 dB).
+    assert cold[0][0] > -60
+    assert partial[0] == cold_override[0] == cold[0]
+    assert partial == cold_override
 
 
 def test_a_failed_note_read_is_unresolved_and_left_out_of_the_notes(song):
