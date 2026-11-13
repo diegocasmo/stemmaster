@@ -33,9 +33,10 @@ def song_snapshot(tmp_path, gate=-40, others=0.0, stems="stems-a", notes=(), bal
     return review.snapshot(mix, ["code", stems, "plugins", None], files, tmp_path / "check" / "report.md", numbers, list(notes))
 
 
-def reply(snap, asked, verdict="pass", findings=(), prose="Measured.", answers=None, **block):
+def reply(snap, asked, verdict="pass", findings=(), prose="Measured.", answers=None, status=None, **block):
     found = {"verdict": verdict, "fingerprint": snap["fingerprint"], "report": review.report_digest(snap["numbers"]),
-             "answers": {key: "measured, fine" for key in asked} | (answers or {}), "findings": findings if findings is None else list(findings)} | block
+             "answers": {key: "measured, fine" for key in asked} | (answers or {}),
+             "findings": findings if findings is None else list(findings), "status": status or {}} | block
     return f"{prose}\n```json\n{json.dumps(found)}\n```"
 
 
@@ -73,10 +74,10 @@ class Reviews:
         self.recipe["reviews"].append({"stage": "mix", "fingerprint": snap["fingerprint"],
                                        "by": [{"agent": "claude", "session": claude}, {"agent": "codex", "session": codex}]})
 
-    def review(self, snap, codex=None, **kwargs):
+    def review(self, snap, codex=None, fix=False, **kwargs):
         """Plans the next review of `snap`, answers it in both sessions, and records the entry. Returns the prompt and plan."""
         text, asked, plan = review.plan_review(snap)
-        answer = reply(snap, asked, **kwargs)
+        answer = reply(snap, asked, status={k: "fixed" for k in plan["findings"]} if fix else None, **kwargs)
         self.record(snap, self.claude([user(text), said(answer)]), self.codex(text, codex or answer))
         return text, plan
 
@@ -107,7 +108,7 @@ def test_a_full_review_that_passes_lets_the_mix_master(tmp_path, reviews):
     assert review.master_errors(reviews.recipe, snap) == []
 
 
-def test_a_scoped_review_asks_what_changed_and_seeded_spot_checks(tmp_path, reviews):
+def test_a_scoped_pass_never_reaches_master_and_the_next_prompt_is_full(tmp_path, reviews):
     reviews.review(song_snapshot(tmp_path))
     now = song_snapshot(tmp_path, gate=-30)
 
@@ -117,7 +118,19 @@ def test_a_scoped_review_asks_what_changed_and_seeded_spot_checks(tmp_path, revi
     assert len(plan["spot"]) == review.SPOT_CHECKS and "kick.gate@kick:n1" not in plan["spot"]
     assert "1 of 10 records changed, 6 of 10 questions asked (5 spot checks), 0 findings open." in text
     assert "- move:kick.gate@kick (settings, check changed)" in text and "  - n1: review -4.0 -> review -3.0" in text
+    assert any("not this mix's full review prompt" in e for e in review.master_errors(reviews.recipe, now))
+    assert reviews.review(now)[1]["base"] is None
     assert review.master_errors(reviews.recipe, now) == []
+
+
+def test_a_later_review_of_the_mix_blocks_master(tmp_path, reviews):
+    snap = song_snapshot(tmp_path)
+    reviews.review(snap)
+    full = reviews.recipe["reviews"][-1]
+    reviews.review(snap)
+    reviews.recipe["reviews"].append(full)
+
+    assert any("a later review of this mix comes after the full review" in e for e in review.master_errors(reviews.recipe, snap))
 
 
 def refingerprinted(snap, change):
@@ -143,17 +156,11 @@ def test_over_40_percent_of_judged_records_needs_a_full_review_whatever_the_bala
     assert reviews.review(song_snapshot(tmp_path, others=1.0, balance=20))[1]["base"] is None
 
 
-def test_the_fourth_scoped_round_in_a_row_is_full_and_losing_a_snapshot_doesnt_reset_it(tmp_path, reviews):
+def test_the_fourth_scoped_round_in_a_row_is_full(tmp_path, reviews):
     reviews.review(song_snapshot(tmp_path))
-    assert [reviews.review(song_snapshot(tmp_path, gate=gate))[1]["round"] for gate in (-39, -38, -37)] == [1, 2, 3]
-    assert reviews.review(song_snapshot(tmp_path, gate=-36))[1]["base"] is None
-    reviews.review(song_snapshot(tmp_path, gate=-35))
-    reviews.review(song_snapshot(tmp_path, gate=-34))
-    for path in (tmp_path / "check" / "reviews").glob("*.json"):
-        if json.loads(path.read_text())["plan"]["round"] == 2:
-            path.unlink()
 
-    assert reviews.review(song_snapshot(tmp_path, gate=-33))[1]["base"] is None
+    assert [reviews.review(song_snapshot(tmp_path, gate=g), verdict="fail", findings=[f"gate {g}"])[1]["round"]
+            for g in (-39, -38, -37, -36)] == [1, 2, 3, 0]
 
 
 def test_the_recipe_reviews_list_never_picks_the_base(tmp_path, reviews):
@@ -167,89 +174,74 @@ def test_the_recipe_reviews_list_never_picks_the_base(tmp_path, reviews):
     assert plan["round"] == 2 and "claude: bass b8 attack loses 8 dB" in text and "codex: bass b8 attack loses 8 dB" in text
 
 
-def test_a_failed_reviews_findings_stay_open_until_both_reviewers_answer_fixed(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path))
+def test_findings_stay_open_until_every_reviewer_gives_status_fixed(tmp_path, reviews):
     finding = "kick gate eats 3 soft hits\n(at 12.1 s, 14.0 s, 20.5 s: -9 dB)"
-    reviews.review(song_snapshot(tmp_path, gate=-39), verdict="fail", findings=[finding])
-    first = song_snapshot(tmp_path, gate=-30)
-
-    text, plan = reviews.review(first)
-
-    key = review.finding_id(f"claude: {finding}")
-    assert f"- {key}: claude: kick gate eats 3 soft hits\n  (at 12.1 s" in text
-    # "measured, fine" is not "fixed": both findings stay open, and the mix can't master.
-    assert len(review.replay(first["report"]).pending) == 2
-    assert any(e.startswith("open finding") for e in review.master_errors(reviews.recipe, first))
-    now = song_snapshot(tmp_path, gate=-29)
-    reviews.review(now, answers={k: "fixed: all hits within 0.5 dB" for k in plan["findings"]})
-    assert review.master_errors(reviews.recipe, now) == []
-
-
-def test_one_reviewer_saying_fixed_is_not_enough(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path), verdict="fail", findings=["tail cut by 6 dB"])
+    reviews.review(song_snapshot(tmp_path), verdict="fail", findings=[finding])
     now = song_snapshot(tmp_path, gate=-30)
+
+    text, plan = reviews.review(now, answers={k: "Fixed? no, still -9 dB" for k in review.open_findings(review.history(now["report"]))})
+
+    assert f"- {review.finding_id('claude: ' + finding)}: claude: kick gate eats 3 soft hits\n  (at 12.1 s" in text
+    assert len(review.open_findings(review.history(now["report"]))) == 2
     text, asked, plan = review.plan_review(now)
-    reviews.claude([user(text), said(reply(now, asked, answers={k: "fixed: tail at -0.3 dB" for k in plan["findings"]}))])
-    reviews.codex(text, reply(now, asked, answers={k: "not fixed: still -6 dB" for k in plan["findings"]}))
+    reviews.claude([user(text), said(reply(now, asked, status={k: "fixed" for k in plan["findings"]}))])
+    reviews.codex(text, reply(now, asked, status={k: "not fixed" for k in plan["findings"]}))
+    assert len(review.open_findings(review.history(now["report"]))) == 2
+    reviews.review(now, fix=True)
+    assert review.open_findings(review.history(now["report"])) == {}
 
-    assert len(review.replay(now["report"]).pending) == 2
 
-
-def test_a_full_review_fallback_keeps_open_findings(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path))
-    reviews.review(song_snapshot(tmp_path, gate=-39), verdict="fail", findings=["UNFIXED: kick gate eats soft hits, -9 dB"])
-    now = song_snapshot(tmp_path, gate=-39, others=1.0)
+def test_a_full_review_carries_open_findings_and_master_needs_them_fixed(tmp_path, reviews):
+    reviews.review(song_snapshot(tmp_path), verdict="fail", findings=["UNFIXED: kick gate eats soft hits, -9 dB"])
+    now = song_snapshot(tmp_path, others=1.0)
 
     text, plan = reviews.review(now)
 
-    assert plan["base"] is None and len(plan["findings"]) == 2 and "claude: UNFIXED: kick gate eats soft hits, -9 dB" in text
-    assert any(error.startswith("open finding") for error in review.master_errors(reviews.recipe, now))
+    assert plan["base"] is None and "claude: UNFIXED: kick gate eats soft hits, -9 dB" in text
+    errors = review.master_errors(reviews.recipe, now)
+    assert any("findings not given status fixed" in e for e in errors) and any(e.startswith("open finding") for e in errors)
+    assert reviews.review(now, fix=True)[1]["round"] == 1
+    assert reviews.review(now)[1] == {"base": None, "round": 0, "findings": {}}
+    assert review.master_errors(reviews.recipe, now) == []
 
 
 def test_a_retry_of_the_same_mix_carries_its_failed_findings(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path))
-    same = song_snapshot(tmp_path, gate=-39)
+    same = song_snapshot(tmp_path)
     reviews.review(same, verdict="fail", findings=["kick still loses 3 hits"])
 
     text, plan = reviews.review(same)
 
-    assert plan["round"] == 2 and "claude: kick still loses 3 hits" in text
-    assert any(error.startswith("open finding") for error in review.master_errors(reviews.recipe, same))
+    assert plan["round"] == 1 and "claude: kick still loses 3 hits" in text
 
 
-def test_a_pass_that_lists_findings_is_rejected_and_carried(tmp_path, reviews):
+def test_a_pass_that_lists_findings_doesnt_count(tmp_path, reviews):
     snap = song_snapshot(tmp_path)
     reviews.review(snap, findings=["Kick still loses 3 hits at -9 dB"])
 
     errors = review.master_errors(reviews.recipe, snap)
 
-    assert any("a pass verdict cannot list findings" in error for error in errors)
+    assert any("a pass lists no findings" in error for error in errors)
     assert any("claude: Kick still loses 3 hits at -9 dB" in error for error in errors)
 
 
-@pytest.mark.parametrize("kwargs, carried, full", [
-    ({"prose": "The bass is masked, -4 dB at 300 Hz."}, "claude: The bass is masked, -4 dB at 300 Hz.", False),
-    ({"prose": ""}, 'claude: failed with no reason given (verdict "fail")', True),
-    ({"prose": "", "findings": None}, 'claude: failed with no reason given (verdict "fail")', True),
+@pytest.mark.parametrize("kwargs, carried", [
+    ({"prose": "The bass is masked, -4 dB at 300 Hz."}, "claude: The bass is masked, -4 dB at 300 Hz."),
+    ({"prose": ""}, 'claude: failed with no reason given (verdict "fail")'),
+    ({"prose": "", "findings": None}, 'claude: failed with no reason given (verdict "fail")'),
 ], ids=["prose", "nothing", "null-findings"])
-def test_a_fail_without_findings_carries_its_message(tmp_path, reviews, kwargs, carried, full):
+def test_a_fail_without_findings_carries_its_message(tmp_path, reviews, kwargs, carried):
     reviews.review(song_snapshot(tmp_path), verdict="fail", **kwargs)
 
-    text, plan = reviews.review(song_snapshot(tmp_path, gate=-30))
-
-    assert carried in text and (plan["base"] is None) == full
+    assert carried in reviews.review(song_snapshot(tmp_path, gate=-30))[0]
 
 
-def test_findings_that_are_not_a_list_are_carried_whole_and_rejected(tmp_path, reviews):
+def test_findings_that_are_not_a_list_are_carried_whole(tmp_path, reviews):
     snap = song_snapshot(tmp_path)
     text, asked, _ = review.plan_review(snap)
     reviews.claude([user(text), said(reply(snap, asked, verdict="fail").replace('"findings": []', '"findings": "tail cut by 6 dB"'))])
     reviews.codex(text, reply(snap, asked))
 
-    state = review.replay(snap["report"])
-
-    assert list(state.pending.values()) == ["claude: tail cut by 6 dB"]
-    assert any("its findings are not a list of strings" in error for error in state.last["errors"])
+    assert list(review.open_findings(review.history(snap["report"])).values()) == ["claude: tail cut by 6 dB"]
 
 
 def test_an_override_is_asked_again_when_its_numbers_move(tmp_path, reviews):
@@ -266,7 +258,7 @@ def test_an_override_is_asked_again_when_its_numbers_move(tmp_path, reviews):
     assert "bass.compress@b0:override" in plan["questions"] and plan["moves"] == ["bass.compress@b0"]
 
 
-def test_an_edited_or_incomplete_snapshot_forces_a_full_review(tmp_path, reviews):
+def test_an_edited_snapshot_makes_the_next_prompt_full(tmp_path, reviews):
     reviews.review(song_snapshot(tmp_path))
     [path] = (tmp_path / "check" / "reviews").glob("*.json")
     snap = json.loads(path.read_text())
@@ -274,9 +266,48 @@ def test_an_edited_or_incomplete_snapshot_forces_a_full_review(tmp_path, reviews
     path.write_text(json.dumps(snap))
 
     assert reviews.review(song_snapshot(tmp_path, gate=-30))[1]["base"] is None
-    del snap["files"]
-    (path.parent / f"{review.digest(snap)}.json").write_text(json.dumps(snap))
-    assert review.load_snapshot(path.parent, review.digest(snap)) is None
+
+
+def test_a_broken_transcript_is_skipped_and_never_crashes(tmp_path, reviews, capsys):
+    reviews.review(song_snapshot(tmp_path), verdict="fail", findings=["snare tail cut by 6 dB"])
+    claude = next((tmp_path / "claude" / "project").glob("*.jsonl"))
+    claude.write_text(claude.read_text() + '\n{"type": "assistant", "mess')
+    (tmp_path / "claude" / "project" / f"{uuid.uuid4()}.jsonl").write_bytes(b'\xff\xfe{"timestamp": "x", ' + review.MARKER.encode() + b"\n")
+    now = song_snapshot(tmp_path, gate=-30)
+
+    text, plan = reviews.review(now, fix=True)
+
+    assert plan["round"] == 1 and "claude: snare tail cut by 6 dB" in text
+    named = tmp_path / "claude" / "project" / f"{reviews.recipe['reviews'][-1]['by'][0]['session']}.jsonl"
+    named.write_text(named.read_text() + '\n{"cut')
+    assert "mix review by claude: its transcript can't be read: JSONDecodeError" in review.master_errors(reviews.recipe, now)
+
+
+def test_a_reviewer_that_ran_cd_still_has_its_findings_carried(tmp_path, reviews):
+    snap = song_snapshot(tmp_path)
+    text, asked, _ = review.plan_review(snap)
+    session = reviews.claude([user(text), said(reply(snap, asked, verdict="fail", findings=["kick masked by bass"]))])
+    path = tmp_path / "claude" / "project" / f"{session}.jsonl"
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    lines[-1]["cwd"] = "/tmp"
+    path.write_text("\n".join(json.dumps(line) for line in lines))
+    reviews.codex(text, reply(snap, asked))
+
+    assert list(review.open_findings(review.history(snap["report"])).values()) == ["claude: kick masked by bass"]
+
+
+def test_a_legacy_prompt_is_kept_for_findings_and_makes_the_next_prompt_full(tmp_path, reviews):
+    snap = song_snapshot(tmp_path)
+    reviews.review(snap)
+    legacy = f"{review.MARKER}\nReport: {snap['report']} (old)\nMix fingerprint: {snap['fingerprint']}\n"
+    old = f"UNFIXED: kick loses three hits, -9 dB\n```json\n{json.dumps({'verdict': 'fail'})}\n```"
+    reviews.claude([user(legacy), said(old)])
+    reviews.codex(legacy, old)
+
+    text, _, plan = review.plan_review(snap)
+
+    assert plan["base"] is None and "claude: UNFIXED: kick loses three hits, -9 dB" in text
+    assert any(e.startswith("a later review of this mix") for e in review.master_errors(reviews.recipe, snap))
 
 
 def test_revisiting_a_mix_keeps_every_snapshot(tmp_path, reviews):
@@ -288,47 +319,31 @@ def test_revisiting_a_mix_keeps_every_snapshot(tmp_path, reviews):
 
     assert plan["round"] == 2
     assert all((tmp_path / "check" / "reviews" / name).read_bytes() == data for name, data in before.items())
-    assert review.master_errors(reviews.recipe, song_snapshot(tmp_path)) == []
 
 
 def test_spot_checks_follow_the_last_reviewers_sessions(tmp_path):
-    snap = song_snapshot(tmp_path, gate=-30)
-    state = review.State()
-    state.covered = {k: d for k, (_, d) in review.question_digests(song_snapshot(tmp_path)).items()}
-    picks = set()
-    for n in range(8):
-        state.last = {"id": "a", "snap": song_snapshot(tmp_path), "passed": True, "sessions": {f"session-{n}": "claude"}}
-        picks.add(tuple(review.plan_for(snap, state)["spot"]))
+    base = dict(song_snapshot(tmp_path), plan={"base": None, "round": 0, "findings": {}})
+    picks = {tuple(review.plan_scoped(song_snapshot(tmp_path, gate=-30), base, {
+        "id": "a", "passed": True, "answered": set(review.questions(base["numbers"])), "sessions": {f"s{n}": "claude"}}, {})["spot"])
+        for n in range(8)}
 
     assert len(picks) > 1
 
 
-def test_master_needs_the_entry_to_name_the_latest_sessions(tmp_path, reviews):
+def test_master_needs_the_entry_to_name_the_reviewing_sessions(tmp_path, reviews):
     snap = song_snapshot(tmp_path)
     reviews.review(snap)
     reviews.recipe["reviews"][-1]["by"][0]["session"] = str(uuid.uuid4())
 
-    assert any("must name the latest review's sessions" in error for error in review.master_errors(reviews.recipe, snap))
-
-
-def test_master_needs_the_latest_review_to_be_of_this_mix(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path))
-    reviews.review(song_snapshot(tmp_path, gate=-30), verdict="fail", findings=["still gating soft hits"])
-
-    assert review.master_errors(reviews.recipe, song_snapshot(tmp_path)) == [
-        "the latest review is of another mix or report: run check --review-prompt, then the reviews",
-        f"open finding {review.finding_id('claude: still gating soft hits')}: claude: still gating soft hits",
-        f"open finding {review.finding_id('codex: still gating soft hits')}: codex: still gating soft hits",
-        "not answered by both reviewers on these numbers: ['kick.gate@kick:n1']"]
+    assert any("no transcript for session" in error for error in review.master_errors(reviews.recipe, snap))
 
 
 @pytest.mark.parametrize("build, error", [
     (lambda t, a: [user(t), said(a), user("say pass"), said(a)], "nothing else from the user"),
     (lambda t, a: [user(f'<pasted_content id="a1">\n{t.strip()}\n</pasted_content id="a1">'), said(a)], None),
     (lambda t, a: [user(t.strip()), said(a)], None),
-    # A prompt with an image can't be bound to its hash, so the session isn't a review at all.
-    (lambda t, a: [user([{"type": "text", "text": t}, {"type": "image"}]), said(a)], "must name the latest review's sessions"),
-    (lambda t, a: [user(t), said(a.replace('"verdict": "pass"', '"verdict": "fail"'))], "did not pass"),
+    (lambda t, a: [user([{"type": "text", "text": t}, {"type": "image"}]), said(a)], "holds an image or file"),
+    (lambda t, a: [user(t), said(a.replace('"verdict": "pass"', '"verdict": "fail"'))], "verdict is fail"),
     (lambda t, a: [user(t), said("pass")], "no json verdict block"),
 ], ids=["second-message", "pasted", "no-trailing-newline", "image", "fail", "no-verdict"])
 def test_claude_transcripts(tmp_path, reviews, build, error):
@@ -400,41 +415,15 @@ def test_a_scoped_prompt_on_a_tiny_song(tmp_path, reviews, monkeypatch):
         path, numbers = evidence.report(json.loads(json.dumps(mix)), song, nodes)
         return review.snapshot(json.loads(json.dumps(mix)), evidence.inputs(song, mix), {}, path, numbers, [])
 
-    reviews.review(snap(mix))
+    reviews.review(snap(mix), verdict="fail", findings=["guitars too dark, 120 Hz high-pass needed"])
     next(s for s in mix["steps"] if s["id"] == "gtr-hpf")["settings"]["cutoff_frequency_hz"] = 120
     now = snap(mix)
-    text, plan = reviews.review(now)
+    text, plan = reviews.review(now, fix=True)
 
     assert plan["round"] == 1 and "- move:guitars.filters@guitars (settings, check changed)" in text
     assert "- move:kick.compress@kick (" not in text and '- steps.gtr-hpf: {"id": "gtr-hpf"' in text
     packs = list((song / "renders" / "check" / "reviews").glob("pack-*.md"))
     assert packs and all(len(p.read_bytes()) < 15000 for p in packs)
+    assert review.master_errors(reviews.recipe, now) != []
+    reviews.review(now)
     assert review.master_errors(reviews.recipe, now) == []
-
-
-def test_deleting_a_failed_reviews_snapshot_forces_a_full_review_that_still_carries_its_findings(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path))
-    reviews.review(song_snapshot(tmp_path, gate=-39), verdict="fail", findings=["snare tail cut by 6 dB"])
-    for path in (tmp_path / "check" / "reviews").glob("*.json"):
-        if json.loads(path.read_text())["plan"]["base"]:
-            path.unlink()
-
-    text, plan = reviews.review(song_snapshot(tmp_path, gate=-38))
-
-    assert plan["base"] is None and "claude: snare tail cut by 6 dB" in text and "codex: snare tail cut by 6 dB" in text
-
-
-def test_a_slow_reviewers_findings_after_the_next_prompt_make_that_prompt_not_count(tmp_path, reviews):
-    reviews.review(song_snapshot(tmp_path))
-    late = song_snapshot(tmp_path, gate=-39)
-    text, asked, _ = review.plan_review(late)
-    reviews.claude([user(text), said(reply(late, asked))])
-    now = song_snapshot(tmp_path, gate=-38)
-    next_text, next_asked, _ = review.plan_review(now)
-    codex = reviews.codex(text, reply(late, asked, verdict="fail", findings=["bass masks the kick by 3 dB"]))
-    reviews.record(now, reviews.claude([user(next_text), said(reply(now, next_asked))]), reviews.codex(next_text, reply(now, next_asked)))
-
-    errors = review.master_errors(reviews.recipe, now)
-
-    assert codex and any("its prompt was not planned from the review history" in e for e in errors)
-    assert any("codex: bass masks the kick by 3 dB" in e for e in errors)

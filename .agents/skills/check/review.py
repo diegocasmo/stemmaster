@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -71,10 +72,12 @@ FAST_PATHS = [
 ]
 VERDICT_BLOCK = [
     "List every problem you find in findings, each with its numbers, including any answer that fails. A pass lists no "
-    "findings. Every finding is carried, word for word, into each later review until both reviewers of a round answer it fixed.",
+    "findings. Every finding is carried, word for word, into each later review until both reviewers of a round give it "
+    'status "fixed" in the block below.',
     "End your final message with exactly one fenced json block and nothing after it:",
     '```json\n{"verdict": "pass or fail", "fingerprint": "<the mix fingerprint>", "report": "<the report digest>", '
-    '"answers": {"<each question id>": "<your measured answer>"}, "findings": ["<each problem you found, with its numbers>"]}\n```',
+    '"answers": {"<each question id>": "<your measured answer>"}, "findings": ["<each problem you found, with its numbers>"], '
+    '"status": {"<each open finding id>": "fixed or not fixed"}}\n```',
 ]
 REPORTED = ("current", "records", "contracts", "questions")
 SNAPSHOT_FIELDS = {"fingerprint": str, "mix": dict, "inputs": list, "files": dict, "report": str, "numbers": dict,
@@ -327,31 +330,20 @@ def diff(now, base):
             "mix": mix_numbers, "notes": [note for note in now["notes"] if note not in base["notes"]]}
 
 
-class State:
-    """What the reviews so far leave: questions both reviewers answered (by digest), findings still open, the scoped
-    rounds in a row, and the latest attempt. Built only from reviewer transcripts, in time order, and write-once
-    snapshots, so no recipe edit or reordering changes it."""
-
-    def __init__(self):
-        self.covered, self.pending, self.scoped_run, self.last, self.force_full = {}, {}, 0, None, False
-
-
-def plan_for(snap, state):
-    """The review plan for `snap` given `state`: full, or scoped on the latest attempt. Open findings always ride along."""
-    findings = dict(state.pending)
-    last = state.last
-    found = None
-    if last is not None and last["snap"] is not None and not state.force_full and state.scoped_run < MAX_SCOPED:
-        found = diff(snap, last["snap"])
-    if found is None:
-        return {"base": None, "round": 0, "findings": findings}
-    digests = question_digests(snap)
-    asked = sorted(k for k, (_, d) in digests.items() if state.covered.get(k) != d)
+def plan_scoped(now, base, last, pending):
+    """A plan scoped on the latest attempt `last` (whose snapshot is `base`), or None when the next review must be full:
+    the change is too large or of the wrong kind, MAX_SCOPED scoped rounds in a row, or a scoped pass of this very mix,
+    which only a full review can take to --master."""
+    found = diff(now, base)
+    round_ = base["plan"].get("round", 0)
+    if found is None or round_ >= MAX_SCOPED or (round_ and last["passed"] and base["fingerprint"] == now["fingerprint"]):
+        return None
+    digests, old = question_digests(now), question_digests(base)
+    asked = sorted(k for k, (_, d) in digests.items() if k not in last["answered"] or old.get(k, (None, None))[1] != d)
     unchanged = [k for k in digests if k not in asked]
-    # Seeded by the report and by session ids the reviewers' tools chose, which no recipe edit can steer for free.
-    seed = digest([snap["fingerprint"], report_digest(snap["numbers"]), sorted(last["sessions"])])
+    seed = digest([now["fingerprint"], report_digest(now["numbers"]), sorted(last["sessions"])])
     spot = sorted(sorted(unchanged, key=lambda k: sha(seed + k))[:SPOT_CHECKS])
-    return {"base": last["id"], "base_passed": last["passed"], "round": state.scoped_run + 1, "findings": findings,
+    return {"base": last["id"], "base_passed": last["passed"], "round": round_ + 1, "findings": pending,
             "questions": asked, "spot": spot, "moves": sorted(found["moves"])}
 
 
@@ -399,10 +391,11 @@ def render(snap, base):
             f"{len(plan['moves']) + len(change['removed'])} of {change['records']} records changed, {asked} of {len(found)} "
             f"questions asked ({len(plan['spot'])} spot checks), {len(plan['findings'])} findings open.",
             "",
-            "This review is scoped. Every move not listed below has the same recipe entry, settings, check results and "
-            "chain doc as in the last review, and every question not asked here was answered by both reviewers of an "
-            "earlier round on the same numbers. Judge what changed, whether each open finding is fixed, and whether any "
-            "change breaks something. Fail the mix if a change needs more than this list and the numbers to judge.",
+            "This review is scoped, to fix what the last review found; only a full review can clear the mix for "
+            "mastering. Every move not listed below has the same recipe entry, settings, check results and chain doc as "
+            "in the last review, whose reviewers answered every question not asked here. Judge what changed, whether "
+            "each open finding is fixed, and whether any change breaks something. Fail the mix if a change needs more "
+            "than this list and the numbers to judge.",
             "",
             *section("Changed check code or chain docs:", [f"- {shown(path)}" for path in change["files"]]),
             *section("Recipe changes (old -> new), answered under id changes:", [f"- {line}" for line in change["recipe"]]),
@@ -414,8 +407,8 @@ def render(snap, base):
     else:
         notes = snap["notes"]
     if plan["findings"]:
-        lines += section('Open findings from earlier reviews, word for word. Answer each id with "fixed: <numbers>" or '
-                         '"not fixed: <numbers>":', [f"- {key}: " + text.replace("\n", "\n  ") for key, text in plan["findings"].items()])
+        lines += section('Open findings from earlier reviews, word for word. Answer each id with its numbers, and give '
+                         'it status "fixed" or "not fixed" in the verdict block:', [f"- {key}: " + text.replace("\n", "\n  ") for key, text in plan["findings"].items()])
     ids = plan["questions"] if plan["base"] else sorted(found)
     lines += ["Answer every question below from the numbers (and your own measurements if you need them):",
               *[f"- {key}: {found[key]}" for key in ids], ""]
@@ -438,14 +431,20 @@ def canonical(message):
 
 
 SNAPSHOT_LINE = re.compile(r"^This mix's numbers \(write-once\): (.+)$", re.M)
+STATUS = ("fixed", "not fixed")
+
+
+def log(message):
+    print(f"review: {message}", file=sys.stderr)
 
 
 def findings_of(verdict, message, agent):
     """A reviewer's findings, word for word; a fail with none carries its final message, or says it gave no reason."""
+    if verdict is None:
+        return [f"{agent}: {message.strip() or 'ended with no verdict'}"]
     raw = verdict.get("findings")
     items = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else [] if raw is None else [shown(raw)]
-    texts = [item if isinstance(item, str) else shown(item) for item in items]
-    texts = [text for text in texts if text.strip()]
+    texts = [text for text in (item if isinstance(item, str) else shown(item) for item in items) if text.strip()]
     if not texts and verdict.get("verdict") != "pass":
         texts = [message] if message.strip() else [f"failed with no reason given (verdict {shown(verdict.get('verdict'))})"]
     return [f"{agent}: {text}" for text in texts]
@@ -455,140 +454,167 @@ def finding_id(text):
     return f"finding:{sha(text)[:12]}"
 
 
-def attempts(report):
-    """Every review session in this repo whose first message is a review prompt for this song, grouped by prompt, in
-    the order their first session started. Transcripts, not the recipe, are the history."""
-    found = {}
-    for agent, session, started in review_sessions(report):
-        read = (claude_messages if agent == "claude" else codex_messages)(session)
-        # Text before the prompt (a message Codex didn't inject) makes the session not count, but it is still this attempt's.
-        prompts = [canonical(unwrap(text)) for text in (read[0] if read else []) if text is not None]
-        prompt = next((text for text in prompts if text.startswith(MARKER)), None)
-        if prompt is None:
-            continue
-        attempt = found.setdefault(sha(prompt), {"id": sha(prompt), "prompt": prompt, "sessions": [], "started": started})
-        attempt["started"] = min(attempt["started"], started)
-        attempt["sessions"].append((agent, session, read))
-    return sorted(found.values(), key=lambda a: (a["started"], a["id"]))
-
-
-def judge_session(agent, session, read, snap):
-    """(errors, verdict, findings) for one reviewer session of an attempt."""
-    users, assistants = read
-    errors = []
-    if session == os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        errors.append("the reviewing session cannot be the mixing session")
-    if None in users:
-        errors.append("a message to the reviewer holds an image or file, which the prompt hash cannot bind")
-    if len(users) != 1:
-        errors.append("the session must hold the review prompt and nothing else from the user")
-    match = VERDICT.search(assistants[-1]) if assistants and assistants[-1] else None
+def verdict_of(assistants):
+    """The verdict block of a reviewer's last message, or None, and the message without it."""
+    message = assistants[-1] if assistants and isinstance(assistants[-1], str) else ""
+    match = VERDICT.search(message)
     try:
         verdict = json.loads(match.group(1)) if match else None
-    except json.JSONDecodeError:
+    except ValueError:
         verdict = None
-    if not isinstance(verdict, dict):
-        return errors + ["its last message has no json verdict block"], None, \
-            [f"{agent}: " + (assistants[-1] if assistants and assistants[-1] and assistants[-1].strip() else "ended with no verdict")]
-    if snap is not None and (verdict.get("fingerprint") != snap["fingerprint"] or verdict.get("report") != report_digest(snap["numbers"])):
-        errors.append("its verdict is for another mix or report")
-    if not isinstance(verdict.get("answers", {}), dict):
-        errors.append("its answers are not an object")
-        verdict = dict(verdict, answers={})
-    if not (verdict.get("findings") is None or isinstance(verdict.get("findings"), list) and all(isinstance(f, str) for f in verdict["findings"])):
-        errors.append("its findings are not a list of strings")
-    found = findings_of(verdict, assistants[-1][: match.start()].strip(), agent)
-    if verdict.get("verdict") == "pass" and found:
-        errors.append("a pass verdict cannot list findings")
-    return errors, verdict, found
+    return (verdict, message[: match.start()].strip()) if isinstance(verdict, dict) else (None, message)
 
 
 def answered(verdict):
-    return {k for k, v in ((verdict or {}).get("answers") or {}).items() if isinstance(v, str) and v.strip()}
+    answers = (verdict or {}).get("answers")
+    return {k for k, v in answers.items() if isinstance(v, str) and v.strip()} if isinstance(answers, dict) else set()
 
 
-def fixed(verdict, key):
-    answer = ((verdict or {}).get("answers") or {}).get(key)
-    return isinstance(answer, str) and answer.strip().lower().startswith("fixed")
+def status_of(verdict, key):
+    status = (verdict or {}).get("status")
+    return status.get(key) if isinstance(status, dict) else None
 
 
-def replay(report):
-    """Walks the attempts in time order and returns the state they leave, and the latest attempt."""
-    state = State()
-    for attempt in attempts(report):
-        line = SNAPSHOT_LINE.search(attempt["prompt"])
-        snap = load_snapshot(reviews_folder(report), Path(line[1]).stem) if line else None
-        base = state.last["snap"] if state.last else None
-        # A snapshot counts only if this code, from the state before it, plans and words the same prompt.
-        if snap is not None:
-            plan = plan_for({k: v for k, v in snap.items() if k != "plan"}, state)
-            if plan != snap["plan"] or render(snap, base) != attempt["prompt"]:
-                snap = None
-        errors = [] if snap is not None else ["its prompt was not planned from the review history by this code"]
-        by, found = {}, []
-        for agent, session, read in attempt["sessions"]:
-            problems, verdict, findings = judge_session(agent, session, read, snap)
-            errors += [f"{agent} session {session}: {p}" for p in problems]
-            found += findings
-            # A session with any problem neither answers nor fixes anything, but its findings still count.
-            by.setdefault(agent, []).append(None if problems else verdict)
-        verdicts = [v for agent in AGENTS for v in by.get(agent, [None])]
-        asked = asked_ids(snap) if snap is not None else {}
-        everyone = lambda test: bool(verdicts) and None not in verdicts and all(test(v) for v in verdicts)
-        if snap is not None:
-            for key in snap["plan"]["findings"]:
-                if everyone(lambda v: fixed(v, key)):
-                    state.pending.pop(key, None)
-            digests = question_digests(snap)
-            inherited = state.covered if snap["plan"]["base"] else {}
-            state.covered = {k: d for k, d in inherited.items() if k not in asked} | \
-                            {k: digests[k][1] for k in asked if k in digests and everyone(lambda v: k in answered(v))}
-            state.scoped_run = snap["plan"]["round"]
-        else:
-            state.covered, state.scoped_run = {}, MAX_SCOPED
-        for text in found:
-            state.pending.setdefault(finding_id(text), text)
-        unanswered = {k for k in asked if not everyone(lambda v: k in answered(v))}
-        passed = not errors and not found and not unanswered and everyone(lambda v: v.get("verdict") == "pass")
-        state.force_full = snap is None or any(t.endswith("ended with no verdict") or "failed with no reason given" in t for t in found)
-        state.last = {"id": attempt["id"], "snap": snap, "passed": passed, "errors": errors, "unanswered": sorted(unanswered),
-                      "sessions": {session: agent for agent, session, _ in attempt["sessions"]}}
-    return state
+def history(report):
+    """Every review attempt for this song, in the order its first session started: sessions in this repo whose first
+    message is a review prompt for this report, grouped by prompt. Built to plan prompts and to keep findings open; a
+    transcript that can't be read is logged and skipped."""
+    found = {}
+    for agent, session, started in review_sessions(report):
+        try:
+            read = (claude_messages if agent == "claude" else codex_messages)(session, strict=False)
+            # Text before the prompt (a message Codex didn't inject) keeps the session in its attempt, but it never counts.
+            prompt = next((canonical(unwrap(t)) for t in (read[0] if read else []) if t is not None and canonical(unwrap(t)).startswith(MARKER)), None)
+        except Exception as error:
+            log(f"skipped {agent} session {session}: {type(error).__name__}: {error}")
+            continue
+        if prompt is None:
+            continue
+        users, assistants = read
+        verdict, message = verdict_of(assistants)
+        clean = verdict is not None and len(users) == 1 and session != os.environ.get("CLAUDE_CODE_SESSION_ID")
+        attempt = found.setdefault(sha(prompt), {"id": sha(prompt), "prompt": prompt, "started": started, "sessions": {}, "findings": []})
+        attempt["started"] = min(attempt["started"], started)
+        attempt["sessions"][session] = {"agent": agent, "verdict": verdict if clean else None}
+        attempt["findings"] += findings_of(verdict, message, agent)
+    attempts = sorted(found.values(), key=lambda a: (a["started"], a["id"]))
+    for attempt in attempts:
+        verdicts = [s["verdict"] for agent in AGENTS for s in attempt["sessions"].values() if s["agent"] == agent] \
+            if all(any(s["agent"] == agent for s in attempt["sessions"].values()) for agent in AGENTS) else [None]
+        attempt["clean"] = [v for v in verdicts] if None not in verdicts else None
+        attempt["passed"] = attempt["clean"] is not None and not attempt["findings"] and all(v.get("verdict") == "pass" for v in verdicts)
+        attempt["answered"] = set.intersection(*(answered(v) for v in verdicts)) if attempt["clean"] else set()
+    return attempts
+
+
+def open_findings(attempts):
+    """Findings still open after `attempts`: each stays until every clean session of a later attempt that carried it
+    gives it status "fixed" in its verdict block."""
+    pending = {}
+    for attempt in attempts:
+        for key in [k for k in pending if f"\n- {k}: " in attempt["prompt"]]:
+            if attempt["clean"] and all(status_of(v, key) == "fixed" for v in attempt["clean"]):
+                pending.pop(key)
+        for text in attempt["findings"]:
+            pending.setdefault(finding_id(text), text)
+    return pending
+
+
+def readable_history(report):
+    try:
+        return history(report)
+    except Exception as error:
+        log(f"review history unreadable, planning a full review: {type(error).__name__}: {error}")
+        return None
 
 
 def plan_review(now):
-    """Plans and writes the next review of the mix in snapshot `now`; returns its prompt, asked ids and plan."""
-    state = replay(now["report"])
-    snap = dict(now, plan=plan_for(now, state))
+    """Plans and writes the next review of the mix in snapshot `now`: scoped on the latest attempt when its snapshot
+    loads and the change allows, else full. Every open finding rides along. Returns the prompt, asked ids and plan."""
+    attempts = readable_history(now["report"])
+    pending = open_findings(attempts or [])
+    plan, base = {"base": None, "round": 0, "findings": pending}, None
+    if attempts:
+        last = attempts[-1]
+        line = SNAPSHOT_LINE.search(last["prompt"])
+        base = load_snapshot(reviews_folder(now["report"]), Path(line[1]).stem) if line else None
+        try:
+            scoped = plan_scoped(now, base, last, pending) if base is not None else None
+        except Exception as error:
+            log(f"the latest review can't be scoped on, planning a full review: {type(error).__name__}: {error}")
+            scoped = None
+        plan = scoped or plan
+    snap = dict(now, plan=plan)
     save_review(snap)
-    return render(snap, state.last["snap"] if snap["plan"]["base"] else None), asked_ids(snap), snap["plan"]
+    return render(snap, base if plan["base"] else None), asked_ids(snap), plan
+
+
+def full_review_errors(recipe, now, attempts):
+    """The recipe's review of this mix must be a full review whose prompt is exactly today's full prompt for it, with
+    every finding open before it, and both reviewers' sessions must pass it under the original checks."""
+    entries = [r for r in recipe.get("reviews", []) if r.get("stage") == "mix" and r.get("fingerprint") == now["fingerprint"]]
+    if not entries:
+        return [f"--master needs a mix review of fingerprint {now['fingerprint']} (run check --review-prompt, then the reviews)"], None
+    by = {entry.get("agent"): entry.get("session") for entry in entries[-1].get("by", [])}
+    index = next((i for i, a in enumerate(attempts) if any(s in a["sessions"] for s in by.values())), None)
+    before = open_findings(attempts[:index] if index is not None else attempts)
+    snap = dict(now, plan={"base": None, "round": 0, "findings": before})
+    text = render(snap, None)
+    errors = []
+    for agent in AGENTS:
+        label = f"mix review by {agent}"
+        session = by.get(agent)
+        if not session or not UUID.match(session):
+            errors.append(f"{label}: needs a full session uuid")
+            continue
+        if session == os.environ.get("CLAUDE_CODE_SESSION_ID"):
+            errors.append(f"{label}: the reviewing session cannot be the mixing session")
+            continue
+        try:
+            found = (claude_messages if agent == "claude" else codex_messages)(session)
+        except (OSError, ValueError, AttributeError, TypeError) as error:
+            errors.append(f"{label}: its transcript can't be read: {type(error).__name__}")
+            continue
+        if found is None:
+            errors.append(f"{label}: no transcript for session {session} on this machine")
+            continue
+        users, assistants = found
+        if None in users:
+            errors.append(f"{label}: a message to the reviewer holds an image or file, which the prompt hash cannot bind")
+            continue
+        # One turn only: a later message could tell the reviewer what verdict to give.
+        if len(users) != 1:
+            errors.append(f"{label}: the session must hold the review prompt and nothing else from the user")
+            continue
+        if canonical(unwrap(users[0])) != text:
+            errors.append(f"{label}: its first message is not this mix's full review prompt (a scoped review never leads to --master)")
+            continue
+        verdict, _ = verdict_of(assistants)
+        if verdict is None:
+            errors.append(f"{label}: its last message has no json verdict block")
+            continue
+        if verdict.get("verdict") != "pass":
+            errors.append(f"{label}: verdict is {verdict.get('verdict')}")
+        if verdict.get("fingerprint") != now["fingerprint"] or verdict.get("report") != report_digest(now["numbers"]):
+            errors.append(f"{label}: its verdict is for another mix or report")
+        if missing := set(asked_ids(snap)) - answered(verdict):
+            errors.append(f"{label}: unanswered {sorted(missing)}")
+        if verdict.get("findings") not in (None, []):
+            errors.append(f"{label}: a pass lists no findings, got {shown(verdict.get('findings'))}")
+        if unfixed := sorted(k for k in before if status_of(verdict, k) != "fixed"):
+            errors.append(f"{label}: findings not given status fixed: {unfixed}")
+    return errors, index
 
 
 def master_errors(recipe, now):
-    """--master: the latest review attempt is of this mix and report and passed, no finding is open, and every
-    question of this mix was answered by both reviewers of some round on the same numbers."""
-    state = replay(now["report"])
-    last = state.last
-    if last is None:
-        return [f"--master needs a mix review of fingerprint {now['fingerprint']} (run check --review-prompt, then the reviews)"]
-    errors = []
-    if last["snap"] is None:
-        errors.append(f"the latest review {last['id']} does not count: its prompt was not planned from the review history "
-                      "by this code (a reviewer finished after the next prompt was made, or its snapshot is gone)")
-    elif last["snap"]["fingerprint"] != now["fingerprint"] or report_digest(last["snap"]["numbers"]) != report_digest(now["numbers"]):
-        errors.append("the latest review is of another mix or report: run check --review-prompt, then the reviews")
-    else:
-        entries = [r for r in recipe.get("reviews", []) if r.get("stage") == "mix" and r.get("fingerprint") == now["fingerprint"]]
-        named = {entry.get("session"): entry.get("agent") for entry in (entries[-1].get("by", []) if entries else [])}
-        if named != last["sessions"]:
-            errors.append(f"the reviews entry for {now['fingerprint']} must name the latest review's sessions {last['sessions']}")
-        errors += last["errors"] + [f"unanswered {last['unanswered']}"] * bool(last["unanswered"])
-        if not last["passed"] and not last["errors"] and not last["unanswered"]:
-            errors.append("the latest review did not pass")
-    errors += [f"open finding {key}: {text}" for key, text in state.pending.items()]
-    stale = sorted(k for k, (_, d) in question_digests(now).items() if state.covered.get(k) != d)
-    if stale:
-        errors.append(f"not answered by both reviewers on these numbers: {stale}")
+    """--master: the latest review of this mix is a full review that passed, and no finding is open."""
+    attempts = readable_history(now["report"])
+    if attempts is None:
+        return ["the review history can't be read"]
+    errors, index = full_review_errors(recipe, now, attempts)
+    if index is not None and (later := [a["id"] for a in attempts[index + 1 :] if f"\nMix fingerprint: {now['fingerprint']}\n" in a["prompt"]]):
+        errors.append(f"a later review of this mix comes after the full review: {later}")
+    errors += [f"open finding {key}: {text}" for key, text in open_findings(attempts).items()]
     return errors
 
 
@@ -612,10 +638,10 @@ HEAD_LINES = 40
 
 
 def prompt_head(path):
-    """The first lines that hold the review marker, and the session's first timestamp; a cheap filter before the
-    transcript is read in full and checked."""
+    """The first line that holds the review marker, and the session's first timestamp; a cheap filter before the
+    transcript is read in full."""
     try:
-        with open(path) as file:
+        with open(path, errors="replace") as file:
             started = None
             for number, line in enumerate(file):
                 if number >= HEAD_LINES:
@@ -650,14 +676,29 @@ def text_of(content, user=False):
     return "\n".join(part.get("text", "") for part in content if part.get("type") in TEXT_PARTS)
 
 
-def claude_messages(session):
+def entries(path, strict):
+    """A transcript's json lines; when not strict, a line cut off or damaged (a reviewer mid-write) is skipped."""
+    out = []
+    for line in path.read_text(errors="strict" if strict else "replace").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            if strict:
+                raise
+    return out
+
+
+def claude_messages(session, strict=True):
+    """Its user and assistant texts. Strict: every entry is this session in the repo. Not strict (the history), only
+    entries up to the first user message must be, so a reviewer that ran cd still shows its verdict and findings."""
     paths = list(CLAUDE_PROJECTS.glob(f"*/{session}.jsonl"))
     if len(paths) != 1:
         return None
     users, assistants = [], []
-    for line in paths[0].read_text().splitlines():
-        entry = json.loads(line)
-        if entry.get("sessionId", session) != session or entry.get("cwd", str(REPO)) != str(REPO):
+    for entry in entries(paths[0], strict):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("sessionId", session) != session or entry.get("cwd", str(REPO)) != str(REPO) and (strict or not users):
             return None
         if entry.get("isMeta") or entry.get("isSidechain"):
             continue
@@ -715,13 +756,14 @@ def injected(text):
     return head == f"# AGENTS.md instructions for {REPO}\n\n<INSTRUCTIONS>\n{docs}\n\n</INSTRUCTIONS>\n"
 
 
-def codex_messages(session):
+def codex_messages(session, strict=True):
     paths = list(CODEX_SESSIONS.glob(f"**/rollout-*-{session}.jsonl"))
     if len(paths) != 1:
         return None
     users, assistants, turns = [], [], 0
-    for line in paths[0].read_text().splitlines():
-        entry = json.loads(line)
+    for entry in entries(paths[0], strict):
+        if not isinstance(entry, dict) or not isinstance(entry.get("payload", {}), dict):
+            continue
         payload = entry.get("payload", {})
         turns += entry.get("type") == "turn_context"
         if entry.get("type") == "session_meta" and (payload.get("id") != session or payload.get("cwd") != str(REPO)):
