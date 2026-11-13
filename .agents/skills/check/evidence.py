@@ -9,14 +9,13 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pyloudnorm
 import soundfile
 
 ROOT = Path(__file__).resolve().parents[3]
 for skill in ("render", "analyze"):
     sys.path.insert(0, str(ROOT / ".agents" / "skills" / skill))
 import render
-from analyze import bands_db, measure as analyze_file, stereo
+from analyze import bands_db, gated_loudness, measure as analyze_file, stereo
 import hits as hit_tools
 import measure
 from memo import memoized
@@ -197,16 +196,23 @@ def merged(time_lists, rate):
 
 def loudness(audio, rate):
     try:
-        return pyloudnorm.Meter(rate).integrated_loudness(audio)
+        return gated_loudness(audio, rate)
     except ValueError:
         return float("-inf")
 
 
 def matched_master(result, target):
-    """Finds the mix gain that brings the trial to `target` LUFS, bracketing it so a compressor can't stall the search."""
+    """Finds the mix gain that brings the trial to `target` LUFS, bracketing it so a compressor can't stall the search.
+
+    Returns the numbers, the master's input and output at the best gain, and the output's loudness.
+    """
+    last = []
+
     def trial(gain_db):
-        master_in, out = result.master(result.mix * 10 ** (gain_db / 20))
-        return master_in, out, loudness(out, result.rate) - target
+        last.clear()
+        master_in, out = result.master(result.mix * 10 ** (gain_db / 20), last)
+        level = loudness(out, result.rate)
+        return master_in, out, level - target, level
 
     tried = {0.0: trial(0.0)}
     low, high, gain = -np.inf, np.inf, 0.0
@@ -219,10 +225,13 @@ def matched_master(result, target):
         if not low < gain < high:
             gain = (low + high) / 2
         tried[gain] = trial(gain)
+    # Each pass would overwrite the previous one's probes, so only the last pass is probed.
+    for step_id, before, after in last:
+        result.mixer.probed[step_id] = result.mixer.probes[step_id](before, after, result.rate)
     best = min(tried, key=lambda g: abs(tried[g][2]) if np.isfinite(tried[g][2]) else np.inf)
-    master_in, out, error = tried[best]
+    master_in, out, error, level = tried[best]
     return {"drive_change_db": round(best, 2), "residual_lu": measure.rounded(error),
-            "matched": bool(np.isfinite(error) and abs(error) <= MATCH_LU)}, master_in, out
+            "matched": bool(np.isfinite(error) and abs(error) <= MATCH_LU)}, master_in, out, level
 
 
 @memoized
@@ -246,7 +255,7 @@ class Master:
     """A render's trial master, made on first read: matching it to the target runs the master chain several times."""
 
     def __init__(self, result, target):
-        self.result, self.target, self.made = result, target, None
+        self.result, self.target, self.made, self.level = result, target, None, None
 
     def make(self):
         if self.made is None:
@@ -260,7 +269,8 @@ class Master:
                 master_in, trial = self.result.master(self.result.mix)
                 self.made = {"drive_change_db": 0.0, "matched": False}, master_in, trial
             else:
-                self.made = matched_master(self.result, self.target)
+                numbers, master_in, trial, self.level = matched_master(self.result, self.target)
+                self.made = numbers, master_in, trial
 
     def get(self, name):
         if not self.result.master_steps:
@@ -295,7 +305,9 @@ def battery(recipe, result, points, times, chain_nodes, master):
         return out
     numbers, master_in, trial = master.make()
     out["trial"] = dict(numbers)
-    out["trial"] |= {"integrated_lufs": measure.rounded(loudness(trial, rate)),
+    # The matched master already measured its output.
+    level = loudness(trial, rate) if master.level is None else master.level
+    out["trial"] |= {"integrated_lufs": measure.rounded(level),
                      "true_peak_dbtp": measure.rounded(render.true_peak_dbtp(trial))}
     for chain in ("kick", "snare"):
         if len(times.get(chain, [])):

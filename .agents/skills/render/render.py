@@ -89,14 +89,19 @@ def apply(audio, rate, step, context):
     return out.mean(axis=1, keepdims=True) if mono else out
 
 
-def process(audio, rate, steps, target, context):
+def process(audio, rate, steps, target, context, deferred=None):
+    """Runs `steps` on `audio` and probes the probed ones, or, given a `deferred` list, appends their (id, input,
+    output) to it for the caller to probe."""
     for step in steps:
         if step["target"] != target:
             continue
         before = audio
         audio = apply(audio, rate, step, context)
         if step.get("id") in getattr(context, "probes", {}):
-            context.probed[step["id"]] = context.probes[step["id"]](before, audio, rate)
+            if deferred is None:
+                context.probed[step["id"]] = context.probes[step["id"]](before, audio, rate)
+            else:
+                deferred.append((step["id"], before, audio))
     return audio
 
 
@@ -715,16 +720,16 @@ class Result:
             sys.exit(f"--tap {MASTER_IN} needs master steps")
         self.boundary = boundary or (self.master_steps[-1].get("id") if self.master_steps else None)
 
-    def master(self, mix):
+    def master(self, mix, deferred=None):
         """Returns the input of the boundary step (the last master step by default) and the master.
 
         A variant without the boundary step has nothing between the two, so a check that removes the
-        limiter measures no limiting instead of whatever step now comes last.
+        limiter measures no limiting instead of whatever step now comes last. `deferred` is process()'s.
         """
         ids = [step.get("id") for step in self.master_steps]
         split = ids.index(self.boundary) if self.boundary in ids else len(ids)
-        master_in = process(mix, self.rate, self.master_steps[:split], "mix", self.mixer)
-        return master_in, process(master_in, self.rate, self.master_steps[split:], "mix", self.mixer)
+        master_in = process(mix, self.rate, self.master_steps[:split], "mix", self.mixer, deferred)
+        return master_in, process(master_in, self.rate, self.master_steps[split:], "mix", self.mixer, deferred)
 
 
 def render(recipe_path, start_seconds=None, end_seconds=None, final=False, taps=()):

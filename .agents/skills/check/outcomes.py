@@ -1505,7 +1505,8 @@ def actual_master(view):
 
     def compute():
         with incremental.quiet():
-            return view.result.master(view.result.mix)[1] if view.result.master_steps else None
+            # The view copied its probes when it was made, so this pass's would only be thrown away.
+            return view.result.master(view.result.mix, [])[1] if view.result.master_steps else None
     return view.memo(("actual",), compute)
 
 

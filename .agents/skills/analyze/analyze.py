@@ -1,6 +1,8 @@
 import json
 import math
 import sys
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pyloudnorm
@@ -31,6 +33,55 @@ def integrated_lufs(meter, audio):
         return meter.integrated_loudness(audio)
     except ValueError:
         return None
+
+
+_CHANNEL_THREADS = []
+
+
+def _weighted_squares(meter, column, dtype):
+    for stage in meter._filters.values():
+        # pyloudnorm stores each stage's output back into an array of the input's dtype.
+        column = (stage.passband_gain * signal.lfilter(stage.b, stage.a, column)).astype(dtype, copy=False)
+    return np.square(column)
+
+
+def gated_loudness(audio, rate):
+    """pyloudnorm's Meter(rate).integrated_loudness(audio), bit for bit, about twice as fast.
+
+    Each channel is K-weighted on its own thread (lfilter releases the GIL) and squared once rather than once per
+    overlapping block. Every value then goes through pyloudnorm 0.2.0's operations in its order, so the result is the
+    same float; tests compare the two.
+    """
+    meter = pyloudnorm.Meter(rate)
+    pyloudnorm.util.valid_audio(audio, rate, meter.block_size)
+    if audio.ndim == 1:
+        audio = audio.reshape(audio.shape[0], 1)
+    samples, channels = audio.shape
+    columns = [audio[:, ch] for ch in range(channels)]
+    if channels > 1:
+        if not _CHANNEL_THREADS:
+            _CHANNEL_THREADS.append(ThreadPoolExecutor(2))
+        squares = list(_CHANNEL_THREADS[0].map(lambda column: _weighted_squares(meter, column, audio.dtype), columns))
+    else:
+        squares = [_weighted_squares(meter, columns[0], audio.dtype)]
+    gains = [1.0, 1.0, 1.0, 1.41, 1.41]
+    block, step = meter.block_size, 1.0 - meter.overlap
+    blocks = np.arange(0, int(np.round(((samples / meter.rate - block) / (block * step))) + 1))
+    z = np.zeros(shape=(channels, len(blocks)))
+    for j in blocks:
+        lower = int(block * (j * step) * meter.rate)
+        upper = int(block * (j * step + 1) * meter.rate)
+        for i in range(channels):
+            z[i, j] = (1.0 / (block * meter.rate)) * np.sum(squares[i][lower:upper])
+    with warnings.catch_warnings(), np.errstate(divide="ignore"):
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        levels = [-0.691 + 10.0 * np.log10(np.sum([gains[i] * z[i, j] for i in range(channels)])) for j in blocks]
+        gated = [j for j, level in enumerate(levels) if level >= -70.0]
+        average = [np.mean([z[i, j] for j in gated]) for i in range(channels)]
+        relative = -0.691 + 10.0 * np.log10(np.sum([gains[i] * average[i] for i in range(channels)])) - 10.0
+        gated = [j for j, level in enumerate(levels) if (level > relative and level > -70.0)]
+        average = np.nan_to_num(np.array([np.mean([z[i, j] for j in gated]) for i in range(channels)]))
+        return -0.691 + 10.0 * np.log10(np.sum([gains[i] * average[i] for i in range(channels)]))
 
 
 def true_peak_dbtp(audio):
