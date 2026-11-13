@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 
@@ -36,7 +37,7 @@ def test_a_cut_keeps_alignment_and_clips_sections_and_rides(song):
     assert path.parent == song / "renders" / "cuts" / "3-9"
     assert sorted(p.name for p in (path.parent / "stems").iterdir()) == ["bass.wav", "kick.wav"]
     assert out["sections"] == {"b": {"start_s": 1, "end_s": 6, "group": "chorus"}}
-    assert out["steps"][0]["settings"]["segments"] == [[0.4, 1, 2], [1, 6, 1]]
+    assert out["steps"][0]["settings"]["segments"] == [[3.4 - 3, 1, 2], [1, 6, 1]]
     assert out["moves"][0]["trial"]["steps"][0]["settings"]["segments"] == [[0, 0.011, 0.0]]
     assert "reviews" not in out
     # Stateless steps render the window as the whole song does, from the offset's lead-in to the window's end.
@@ -156,3 +157,53 @@ def test_a_cut_says_which_ride_segment_it_drops_and_why(song, capsys):
     cut.cut(song / "recipe.json", ["3", "8"])
 
     assert "segment [1, 3.5, -2] starts before the cut, and the 500 ms left in it are under its ramp_ms 1000" in capsys.readouterr().err
+
+
+def test_a_cut_replaces_a_hard_link_to_the_songs_recipe(song):
+    write(song, "kick.wav", noise(10))
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "sections": {"a": {"start_s": 2, "end_s": 6}}}))
+    original = (song / "recipe.json").read_bytes()
+    (song / "renders" / "cuts" / "2-6").mkdir(parents=True)
+    os.link(song / "recipe.json", song / "renders" / "cuts" / "2-6" / "recipe.json")
+
+    cut.cut(song / "recipe.json", ["2", "6"])
+
+    assert (song / "recipe.json").read_bytes() == original
+
+
+def test_a_cut_keeps_a_stems_format_without_an_extension(song):
+    soundfile.write(song / "stems" / "kick", noise(10), RATE, subtype="FLOAT", format="WAV")
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick": {}}}))
+
+    path = cut.cut(song / "recipe.json", ["2", "6"])
+
+    assert soundfile.info(path.parent / "stems" / "kick").format == "WAV"
+    render.Result(json.loads(path.read_text()), path.parent)
+
+
+def test_a_cut_keeps_exact_ride_times(song):
+    write(song, "kick.wav", noise(10))
+    recipe = {"stems": {"kick.wav": {}}, "steps": [ride([[4.0000001, 6, 6], [6, 7, -3]], ramp_ms=0)]}
+    (song / "recipe.json").write_text(json.dumps(recipe))
+
+    path = cut.cut(song / "recipe.json", ["2", "8"])
+
+    out = json.loads(path.read_text())
+    (_, b, _), (a, _, _) = out["steps"][0]["settings"]["segments"]
+    assert a == b
+    np.testing.assert_allclose(render.Result(out, path.parent).mix, render.Result(recipe, song).mix[2 * RATE : 8 * RATE], atol=1e-12)
+
+
+@pytest.mark.parametrize("segments, ramp_ms, window, error", [
+    ([[26.7, 27.0, 3], [27.0, 28.0, 3]], 300, ["8.6", "30"], "the cut 8.6-30 would not render"),
+    ([[20.2, 20.21, 6], [20.21, 20.23, -6]], 10, ["4.1", "25"], "the cut 4.1-25 would not render"),
+    ([[4, 5, 6]], 2000, ["2", "8"], "the song's recipe does not render"),
+])
+def test_a_cut_whose_shifted_ride_would_not_render_writes_nothing(song, segments, ramp_ms, window, error):
+    write(song, "kick.wav", noise(30))
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "steps": [ride(segments, ramp_ms=ramp_ms)]}))
+
+    with pytest.raises(SystemExit, match=error):
+        cut.cut(song / "recipe.json", window)
+
+    assert not (song / "renders").exists()

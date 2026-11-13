@@ -3,9 +3,11 @@ alignment, with sections and Ride segments shifted into the window and clipped t
 import copy
 import json
 import math
+import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import soundfile
@@ -36,22 +38,6 @@ def window(recipe, args):
     return start, end, f"{start:g}-{end:g}"
 
 
-def shifted(segments, settings, rate):
-    """Segments as close to six decimals as render's validation allows, so rounding never drops or overlaps one."""
-    rounded = [[round(a, 6), round(b, 6), gain] for a, b, gain in segments]
-    for candidate in (rounded, segments):
-        if native.ride_error(dict(settings, segments=candidate), {}, rate) is None:
-            return candidate
-    ramp_ms = settings.get("ramp_ms", native.DEFAULT_RAMP_MS)
-    # Shifting by the cut's start can leave a segment of exactly ramp_ms a hair short; render.check reports any overlap.
-    nudged = []
-    for a, b, gain in segments:
-        while (b - a) * 1000 < ramp_ms:
-            b = math.nextafter(b, math.inf)
-        nudged.append([a, b, gain])
-    return nudged
-
-
 def clip_ride(label, settings, sections, first, last, rate):
     ramp_ms = settings.get("ramp_ms", native.DEFAULT_RAMP_MS)
     half, start = ramp_ms / 2000 * rate, first / rate
@@ -73,10 +59,10 @@ def clip_ride(label, settings, sections, first, last, rate):
                   f"differ from the whole song", file=sys.stderr)
             continue
         # Only a start before the cut is clipped; a segment may run past the audio, so the cut's end ramps as the song's.
+        # Exact shifted times, unrounded: rounding would move a ramp by a sample and part back-to-back segments.
         segments.append([max(a, start) - start, b - start, gain])
     # A Ride needs a segment; one at 0 dB keeps the step, and the check reports it as doing nothing in this cut.
-    segments = shifted(segments, settings, rate) if segments else [[0, (math.ceil(ramp_ms) + 1) / 1000, 0.0]]
-    return dict(settings, segments=segments)
+    return dict(settings, segments=segments or [[0, (math.ceil(ramp_ms) + 1) / 1000, 0.0]])
 
 
 def cut_recipe(recipe, first, last, rate):
@@ -98,10 +84,23 @@ def cut_recipe(recipe, first, last, rate):
     return out
 
 
+def replace(target, write):
+    """Writes a new file and moves it over the target, so a hard link or other entry already there is never written through."""
+    handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    os.close(handle)
+    try:
+        write(temporary)
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 def cut_file(source, target, first, last):
     info = soundfile.info(source)
     audio, rate = soundfile.read(source, start=min(first, info.frames), stop=min(last, info.frames), always_2d=True)
-    soundfile.write(target, audio, rate, subtype=info.subtype)
+    # The source's own format: a stem name without an extension says nothing about it.
+    replace(target, lambda path: soundfile.write(path, audio, rate, subtype=info.subtype, format=info.format))
 
 
 def cut(recipe_path, args):
@@ -112,7 +111,7 @@ def cut(recipe_path, args):
     if not SAFE_NAME.fullmatch(name):
         sys.exit(f"{name}: a cut's name must use only letters, digits and . _ + -; give start and end seconds instead")
     out = song / "renders" / "cuts" / name
-    home = song.resolve() / "renders" / "cuts" / name
+    home = (song / "renders" / "cuts").resolve() / name
     references = sorted(p for p in (song / "references").glob("*") if p.suffix.lower() in AUDIO) \
         if (song / "references").is_dir() else []
     writes = [(recipe_path, "", "recipe.json")] + [(song / "stems" / stem, "stems", stem) for stem in recipe["stems"]]
@@ -142,6 +141,10 @@ def cut(recipe_path, args):
     spans = {stem: (first, last - min(offsets[stem], 0)) for stem in infos}
     frames = {stem: max(0, min(b, infos[stem].frames) - min(a, infos[stem].frames)) for stem, (a, b) in spans.items()}
     timeline = max(frames[stem] + offsets[stem] for stem in infos) + round(recipe.get("tail_seconds", 0) * rate)
+    try:
+        render.check(recipe, rate, length + round(recipe.get("tail_seconds", 0) * rate))
+    except SystemExit as error:
+        sys.exit(f"the song's recipe does not render, so it has no cut: {error}")
     part = cut_recipe(recipe, first, last, rate)
     try:
         render.check(part, rate, timeline)
@@ -158,7 +161,7 @@ def cut(recipe_path, args):
     for path in references:
         own = soundfile.info(path).samplerate
         cut_file(path, out / "references" / path.name, round(first / rate * own), round(last / rate * own))
-    (out / "recipe.json").write_text(json.dumps(part, indent=2) + "\n")
+    replace(out / "recipe.json", lambda path: Path(path).write_text(json.dumps(part, indent=2) + "\n"))
     print(f"window {first / rate:g}-{last / rate:g} s, sections {sorted(part.get('sections', {}))}")
     return out / "recipe.json"
 
