@@ -1,11 +1,15 @@
 import copy
 import json
 
+import chains
+import numpy as np
+import soundfile
+
 import check
 import defaults
 import evidence
 import structure
-from test_apply_defaults import Recipes, chain_recipe, contract, measure, outcomes, song_recipe, step
+from test_apply_defaults import RATE, Recipes, chain_recipe, contract, measure, outcomes, song_recipe, step
 
 
 def leaf(leaf_id, value, test, state, measure="band"):
@@ -255,3 +259,65 @@ def test_a_shared_drop_group_waits_for_the_key_of_a_members_duck():
     numbers["contracts"][1]["outcome"] = "kept"
     _, changes, _, _ = defaults.decide(recipe, numbers, Recipes({}))
     assert sorted(r["source"] for r, _ in changes) == ["a", "c"]
+
+
+def key_group():
+    recipe = {"stems": {"A.wav": {"bus": "rh"}, "B.wav": {}, "C.wav": {"bus": "rh"}}, "buses": {"rh": {}},
+              "sources": {name: {"chain": "guitars", "stems": [f"{name.upper()}.wav"]} for name in ("a", "b", "c")},
+              "steps": [step("shared-eq", "rh", "PeakFilter"), step("b-eq", "B.wav", "PeakFilter"),
+                        step("c-duck", "C.wav", "Duck", key="B.wav")],
+              "moves": [{"move": "guitars.mud-cut", "source": name, "decision": "kept", "steps": [ids], "note": "n"}
+                        for name, ids in (("a", "shared-eq"), ("b", "b-eq"), ("c", "shared-eq"))]}
+    numbers = {"contracts": [contract("guitars.mud-cut", name, "kept", "dropped", needed="false") for name in ("a", "b", "c")]}
+    return recipe, numbers
+
+
+def test_a_group_held_for_a_key_change_that_is_refused_goes_the_same_round():
+    """rev-o-claude-3: b's drop fails the recipe's checks every round, so the a/c group must not wait for it."""
+    recipe, numbers = key_group()
+    needs_b = lambda r: [] if any(s["id"] == "b-eq" for s in r["steps"]) else ["b-eq needed"]
+    new, changes, left, deferred = defaults.decide(recipe, numbers, Recipes({}), validate=needs_b)
+    assert sorted(r["source"] for r, _ in changes) == ["a", "c"] and [r["source"] for r, _ in left] == ["b"] and deferred == []
+    assert [s["id"] for s in new["steps"]] == ["b-eq", "c-duck"]
+
+
+def test_a_group_held_for_a_refused_key_change_on_real_routing_goes(song):
+    """rev-o-codex2-3: dropping b's EQ would leave b's reverb return unfed, which the renderer refuses; a and c share an
+    EQ on their rhythm bus and b keys c's Duck. Validated by the real structural and render checks."""
+    for i, name in enumerate(("Kick.wav", "Bass.wav", "Guitar-A-Rhythm.wav", "Guitar-B-Lead.wav", "Guitar-C-Rhythm.wav")):
+        soundfile.write(song / "stems" / name, np.random.default_rng(i).normal(0, 0.01, (RATE, 2)), RATE, subtype="FLOAT")
+    recipe = {"stems": {"Kick.wav": {}, "Bass.wav": {}, "Guitar-A-Rhythm.wav": {"bus": "guitars-all"},
+                        "Guitar-B-Lead.wav": {"sends": [{"bus": "b-verb", "gain_db": -12}]},
+                        "Guitar-C-Rhythm.wav": {"bus": "guitars-all"}},
+              "buses": {"guitars-all": {}, "b-verb": {}},
+              "sources": {"kick": {"chain": "kick", "stems": ["Kick.wav"]}, "bass": {"chain": "bass", "stems": ["Bass.wav"]},
+                          "a": {"chain": "guitars", "stems": ["Guitar-A-Rhythm.wav"], "split_reason": "rhythm part A"},
+                          "b": {"chain": "guitars", "stems": ["Guitar-B-Lead.wav"], "split_reason": "lead part"},
+                          "c": {"chain": "guitars", "stems": ["Guitar-C-Rhythm.wav"], "split_reason": "rhythm part C"}},
+              "steps": [step("b-eq", "Guitar-B-Lead.wav", "PeakFilter", cutoff_frequency_hz=250, gain_db=6, q=0.7),
+                        step("duck", "Guitar-C-Rhythm.wav", "Duck", key="Guitar-B-Lead.wav", key_band_hz=[150, 500],
+                             threshold_db=-74, ratio=10, range_db=30, attack_ms=0, release_ms=80),
+                        step("shared-eq", "guitars-all", "PeakFilter", cutoff_frequency_hz=250, gain_db=-6, q=4),
+                        step("b-rv", "b-verb", "Reverb", dry_level=0, wet_level=0.3)],
+              "moves": []}
+    docs = chains.parse()[0]
+    for source, chain in structure.instances(recipe):
+        if chain != "master":
+            recipe["moves"] += [{"move": move, "source": source, "decision": "dropped", "note": "n"}
+                                for move in structure.moves_for(recipe, source, chain, docs)]
+    for record in recipe["moves"]:
+        if record["move"] == "guitars.mud-cut":
+            record.update(decision="kept", steps=["b-eq" if record["source"] == "b" else "shared-eq"])
+            if record["source"] == "b":
+                record.update(fields=["stems.Guitar-B-Lead.wav.sends.b-verb"], tool_reason="stand-in")
+        elif (record["move"], record["source"]) == ("guitars.lead-room", "b"):
+            record.update(decision="kept", steps=["duck"])
+        elif (record["move"], record["source"]) == ("guitars.resonance", "b"):
+            record.update(decision="kept", steps=["b-rv"], tool_reason="stand-in")
+    renders = lambda r: check.renders(r, song, False)
+    assert renders(recipe) == [] and defaults.Order(recipe).edges == {"b": {"c"}}
+    numbers = {"contracts": [contract("guitars.mud-cut", name, "kept", "dropped", needed="false") for name in ("a", "b", "c")]}
+    new, changes, left, deferred = defaults.decide(recipe, numbers, Recipes({}), validate=renders)
+    assert sorted(r["source"] for r, _ in changes) == ["a", "c"] and deferred == []
+    assert [r["source"] for r, _ in left] == ["b"] and "buses nothing feeds" in left[0][1]
+    assert renders(new) == [] and "shared-eq" not in {s["id"] for s in new["steps"]}

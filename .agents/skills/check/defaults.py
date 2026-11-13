@@ -197,30 +197,56 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
     units += [("drop", [record for record, _ in group]) for group in drop_groups(drop, copy.deepcopy(recipe), leave)]
     rank = Order(recipe)
     units.sort(key=lambda unit: min(rank.of(record) for record in unit[1]))
-    chosen, deferred, level, busy, busy_nodes = [], [], None, set(), set()
-    out = copy.deepcopy(recipe)
-    for i, unit in enumerate(units):
+    chosen, deferred, held, refused_ids = [], [], [], set()
+    state = {"level": None, "busy": set(), "nodes": set(), "out": copy.deepcopy(recipe)}
+
+    def attempt(unit):
+        """Applies the unit if its level, sources and nodes allow it this round and the recipe still checks with it."""
         records = unit[1]
         sources = {record["source"] for record in records}
         unit_level = min(rank.level(record) for record in records)
         acted = nodes_of(recipe, unit[0], records, patches)
-        if (level is not None and unit_level > level) or sources & busy or rank.upstream(sources) & busy \
-                or acted & busy_nodes or rank.ahead(records, [r for later in units[i + 1:] for r in later[1]]):
-            deferred += [(record, "waits for " + ("a lower level's changes" if level is not None and unit_level > level
-                                                   else "a change before it in signal order")) for record in records]
-            continue
+        lower = state["level"] is not None and unit_level > state["level"]
+        if lower or sources & state["busy"] or rank.upstream(sources) & state["busy"] or acted & state["nodes"]:
+            deferred.extend((record, "waits for " + ("a lower level's changes" if lower else "a change before it in signal order"))
+                            for record in records)
+            return
         candidate, refused = assemble(chosen + [unit])
         if candidate is not None and validate and (new := sorted(set(validate(candidate)) - known)):
             refused = ("left", f"not applied: with it the recipe fails: {new}")
         if refused:
             kind, why = refused
             (left if kind == "left" else deferred).extend((record, why) for record in records)
-            continue
+            if kind == "left":
+                refused_ids.update(id(record) for record in records)
+            return
         chosen.append(unit)
-        out = candidate
-        level = unit_level
-        busy |= sources
-        busy_nodes |= acted
+        state.update(out=candidate, level=unit_level)
+        state["busy"] |= sources
+        state["nodes"] |= acted
+
+    def release_held():
+        # A group held for a later change goes after all, this round, when every change it waited for was refused: those
+        # never go in, so waiting on them would hold it forever. Its blockers share its level, so they are all tried by
+        # the time the next level starts.
+        for unit, blockers in held:
+            if all(id(record) in refused_ids for record in blockers):
+                attempt(unit)
+            else:
+                deferred.extend((record, "waits for a change before it in signal order") for record in unit[1])
+        held.clear()
+
+    level_of = lambda unit: min(rank.level(record) for record in unit[1])
+    for i, unit in enumerate(units):
+        if held and level_of(unit) > level_of(held[0][0]):
+            release_held()
+        blockers = rank.ahead(unit[1], [r for later in units[i + 1:] for r in later[1]])
+        if blockers:
+            held.append((unit, blockers))
+        else:
+            attempt(unit)
+    release_held()
+    out = state["out"]
     changes = []
     for kind, records in chosen:
         for record in records:
@@ -356,8 +382,9 @@ class Order:
         return found
 
     def ahead(self, records, later):
-        """Whether a shared group would run ahead of one of its members' order: a later change, on the same level, keys
-        a Duck on a member's source or comes before the member in that source's chain."""
+        """The later changes, on the same level, that a shared group would run ahead of: those keying a Duck on a
+        member's source or coming before a member in that source's chain."""
+        found = []
         for member in records:
             # Sources on one Duck cycle keep README's order among themselves, so they don't wait for each other here.
             keys = self.upstream({member["source"]}) - self.part.get(member["source"], frozenset())
@@ -365,8 +392,8 @@ class Order:
                 if self.level(other) != self.level(member):
                     continue
                 if other["source"] in keys or (other["source"] == member["source"] and self.of(other) < self.of(member)):
-                    return True
-        return False
+                    found.append(other)
+        return found
 
     def upstream(self, sources):
         """Every source whose output a Duck in these sources is keyed on, directly or through other Ducks."""
