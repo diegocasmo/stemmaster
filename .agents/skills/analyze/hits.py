@@ -79,7 +79,7 @@ def band_energy(audio, rate, low, high):
     return (fft.irfft(spectrum, size, axis=0)[: len(audio)] ** 2).sum(axis=1)
 
 
-def measure(audio, rate, times):
+def measure(audio, rate, times, include_off_hit=True):
     energy = (audio**2).sum(axis=1)
     cumulative = np.concatenate([[0.0], np.cumsum(energy)])
     level = envelope_db(energy, rate)
@@ -94,7 +94,7 @@ def measure(audio, rate, times):
         "level_db": np.array([level[t : t + reach].max() for t in times]),
         "attack_db": ratio_db(span_energy(cumulative, times, ATTACK_MS, rate), span_energy(cumulative, times, BODY_MS, rate)),
         "tail_db": ratio_db(span_energy(cumulative, times, TAIL_MS, rate), span_energy(cumulative, times, HEAD_MS, rate)),
-        "off_hit_level_db": np.maximum(level[off], LEVEL_FLOOR_DB),
+        "off_hit_level_db": np.maximum(level[off], LEVEL_FLOOR_DB) if include_off_hit else None,
         "bleed_db": bleed,
     }
 
