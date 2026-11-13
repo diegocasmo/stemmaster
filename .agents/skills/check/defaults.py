@@ -171,9 +171,9 @@ def decide(recipe, numbers, variants, frozen=None, master_only=False, validate=N
             changes.append((record, f"kept: its trial worked; added steps {steps}" + (f" and {fields}" if fields else "")
                             + "; its note is as written"))
     for group in drop_groups(drop, out, leave):
-        candidate = out
+        # One off variant for the whole group: pruning a return between its records would strand the next one's claims.
+        candidate = drop_claims(out, [record for record, _ in group])
         for record, _ in group:
-            candidate = drop_claims(candidate, record)
             entry = candidate["moves"][index[(record["move"], record["source"])]]
             entry["decision"] = "dropped"
             for key in ("steps", "fields"):
@@ -231,15 +231,16 @@ def fed(recipe):
     return {settings.get("bus", "mix") for settings in entries} | {send["bus"] for settings in entries for send in settings.get("sends", [])}
 
 
-def drop_claims(recipe, record):
-    """The record's off variant, as the check measured it, without the empty sends lists and unfed returns that leaves.
+def drop_claims(recipe, records):
+    """The records' off variant, as the check measured it, without the empty sends lists and unfed returns that leaves.
 
     A return the drop leaves unfed renders silence, and the renderer refuses an unfed bus in a song's own recipe, so it
     goes when no step acts on it.
     """
     before = fed(recipe)
-    out = evidence.off_variant(recipe, record)
-    for field in record.get("fields", []):
+    union = {key: list(dict.fromkeys(c for record in records for c in record.get(key, []))) for key in ("steps", "fields")}
+    out = evidence.off_variant(recipe, union)
+    for field in union["fields"]:
         kind, rest = field.split(".", 1)
         if ".sends." in rest:
             name = rest.split(".sends.")[0]
