@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import numpy as np
 import soundfile
 
@@ -34,8 +36,8 @@ def test_a_cut_keeps_alignment_and_clips_sections_and_rides(song):
     assert path.parent == song / "renders" / "cuts" / "3-9"
     assert sorted(p.name for p in (path.parent / "stems").iterdir()) == ["bass.wav", "kick.wav"]
     assert out["sections"] == {"b": {"start_s": 1, "end_s": 6, "group": "chorus"}}
-    assert out["steps"][0]["settings"]["segments"] == [[0.4, 1, 2], ["b", 1]]
-    assert out["moves"][0]["trial"]["steps"][0]["settings"]["segments"] == [[0, 0.01, 0.0]]
+    assert out["steps"][0]["settings"]["segments"] == [[0.4, 1, 2], [1, 6, 1]]
+    assert out["moves"][0]["trial"]["steps"][0]["settings"]["segments"] == [[0, 0.011, 0.0]]
     assert "reviews" not in out
     # Stateless steps render the window as the whole song does, from the offset's lead-in to the window's end.
     whole, part = render.Result(recipe(), song).mix, render.Result(out, path.parent).mix
@@ -53,3 +55,59 @@ def test_a_cut_by_sections_spans_them(song):
 
     assert path.parent.name == "a-b"
     assert soundfile.info(path.parent / "stems" / "kick.wav").frames == 9 * RATE
+
+
+def ride(segments, **settings):
+    return {"id": "r", "target": "mix", "plugin": "Ride", "settings": dict(settings, segments=segments)}
+
+
+def test_a_cut_never_writes_outside_its_folder(song):
+    write(song, "kick.wav", noise(10))
+    (song / "references").mkdir()
+    (song / "references" / "keep.wav").write_bytes(b"")
+    (song / "renders" / "cuts").mkdir(parents=True)
+    (song / "recipe.json").write_text(json.dumps({"stems": {"kick.wav": {}}, "sections": {"../..": {"start_s": 0, "end_s": 4}}}))
+
+    with pytest.raises(SystemExit, match="name must use only"):
+        cut.cut(song / "recipe.json", ["../.."])
+
+    assert (song / "stems" / "kick.wav").exists() and (song / "references" / "keep.wav").exists()
+
+
+def test_a_cut_holds_its_sections_when_a_stem_is_placed_early(song):
+    write(song, "kick.wav", noise(10))
+    recipe = {"stems": {"kick.wav": {"offset_samples": -480}}, "sections": {"verse": {"start_s": 2, "end_s": 6}}}
+    (song / "recipe.json").write_text(json.dumps(recipe))
+
+    path = cut.cut(song / "recipe.json", ["verse"])
+
+    whole, part = render.Result(recipe, song).mix, render.Result(json.loads(path.read_text()), path.parent).mix
+    np.testing.assert_array_equal(part, whole[2 * RATE : 6 * RATE])
+
+
+def test_a_cut_keeps_the_gain_of_a_ride_on_a_short_section(song):
+    write(song, "kick.wav", noise(10))
+    recipe = {"stems": {"kick.wav": {}}, "sections": {"short": {"start_s": 4, "end_s": 6}}, "steps": [ride([["short", 6]])]}
+    (song / "recipe.json").write_text(json.dumps(recipe))
+
+    path = cut.cut(song / "recipe.json", ["1", "9"])
+
+    out = json.loads(path.read_text())
+    assert out["sections"] == {} and out["steps"][0]["settings"]["segments"] == [[3, 5, 6]]
+    np.testing.assert_allclose(render.Result(out, path.parent).mix, render.Result(recipe, song).mix[RATE : 9 * RATE])
+
+
+@pytest.mark.parametrize("segments, settings, window", [
+    ([[1, 5, -2], [6, 7, 1]], {"ramp_ms": 0}, ["5", "8"]),
+    ([[1, 3, -2]], {"ramp_ms": 0}, ["5", "8"]),
+    ([["verse", -3]], {"ramp_ms": 8000}, ["6", "10"]),
+])
+def test_a_cut_of_a_ride_renders(song, segments, settings, window):
+    write(song, "kick.wav", noise(10))
+    recipe = {"stems": {"kick.wav": {}}, "sections": {"verse": {"start_s": 0, "end_s": 10}}, "steps": [ride(segments, **settings)]}
+    render.check(recipe, *render.timeline(recipe, song))
+    (song / "recipe.json").write_text(json.dumps(recipe))
+
+    path = cut.cut(song / "recipe.json", window)
+
+    render.Result(json.loads(path.read_text()), path.parent)
