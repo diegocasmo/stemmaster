@@ -1,7 +1,10 @@
 """Tapped signals kept in an unlinked temp file and read back on each use, so a render's taps don't all sit in memory."""
 import collections
+import contextlib
 import itertools
 import os
+import resource
+import shutil
 import tempfile
 import time
 import weakref
@@ -16,12 +19,29 @@ BUDGET = 0
 # FLOOR, or unknown, taps go to disk whatever the budget, so a run that free memory shrinks under keeps going.
 FREE, FLOOR = None, 0.0
 _FREE_READ = [-1.0, False]
+# Disk left free on the temp folder's volume: the check still has its caches and report to write.
+SPARE_BYTES = 2 << 30
 _LRU = collections.OrderedDict()
 _HELD = [0]
+_PEAK = [0, 0]
 _SERIAL = itertools.count()
 
 
+def _note_peak():
+    # _HELD changes only here and in _forget, so a peak reached since the last change was reached with this many bytes held.
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if peak > _PEAK[0]:
+        _PEAK[:] = [peak, _HELD[0]]
+
+
+def held_at_peak():
+    """Bytes of taps held in memory when this process last reached its peak resident size."""
+    _note_peak()
+    return _PEAK[1]
+
+
 def _touch(store, name, nbytes):
+    _note_peak()
     key = (store.serial, name)
     if key in _LRU:
         _HELD[0] -= _LRU[key][1]
@@ -29,12 +49,15 @@ def _touch(store, name, nbytes):
     _HELD[0] += nbytes
     _LRU.move_to_end(key)
     limit = 0 if _short() else BUDGET
-    while len(_LRU) > RESIDENT and _HELD[0] > limit:
-        (_, old), (ref, size) = _LRU.popitem(last=False)
-        _HELD[0] -= size
+    # A tap that can't go to disk stays counted, and is tried again at the next store.
+    for old in list(_LRU):
+        if len(_LRU) <= RESIDENT or _HELD[0] <= limit:
+            break
+        ref, size = _LRU[old]
         owner = ref()
-        if owner is not None:
-            owner._spill(old)
+        if owner is None or owner._spill(old[1]):
+            del _LRU[old]
+            _HELD[0] -= size
 
 
 def _short():
@@ -47,6 +70,7 @@ def _short():
 
 
 def _forget(serial):
+    _note_peak()
     for key in [key for key in _LRU if key[0] == serial]:
         _HELD[0] -= _LRU.pop(key)[1]
 
@@ -71,15 +95,18 @@ class Taps:
             _touch(self, name, audio.nbytes)
 
     def _spill(self, name):
+        """Moves a tap to disk; False when it stays in memory: the temp folder's volume is short of space or failed."""
         audio = self.resident.get(name)
         if audio is None:
-            return
+            return True
         if name in self.spilled:
             del self.resident[name]
-            return
+            return True
         order = "C" if audio.flags.c_contiguous else "F"
         raw = memoryview(audio if order == "C" else audio.T).cast("B")
         try:
+            if shutil.disk_usage(tempfile.gettempdir()).free < len(raw) + SPARE_BYTES:
+                return False
             if self.file is None:
                 # Unlinked at once, so a killed worker leaves nothing behind: the space goes with the descriptor.
                 self.file = tempfile.TemporaryFile(prefix="stemmaster-taps-", buffering=0)
@@ -87,11 +114,15 @@ class Taps:
             while written < len(raw):
                 written += os.pwrite(self.file.fileno(), raw[written:], self.end + written)
         except OSError:
-            # A full or unwritable temp folder costs memory, never the check.
-            return
+            # A failed write costs memory, never the check: what it wrote is given back.
+            if self.file is not None:
+                with contextlib.suppress(OSError):
+                    os.ftruncate(self.file.fileno(), self.end)
+            return False
         self.spilled[name] = (self.end, audio.shape, audio.dtype, order)
         self.end += len(raw)
         del self.resident[name]
+        return True
 
     def _load(self, name):
         offset, shape, dtype, order = self.spilled[name]

@@ -69,6 +69,53 @@ def test_a_tap_that_cant_be_written_stays_in_memory(monkeypatch):
     assert taps["a"] is audio
 
 
+def test_a_tap_stays_in_memory_when_its_spill_would_leave_the_disk_short(monkeypatch):
+    monkeypatch.setattr(spill, "RESIDENT", 0)
+    monkeypatch.setattr(spill.shutil, "disk_usage", lambda path: SimpleNamespace(free=spill.SPARE_BYTES + 100))
+    taps = spill.Taps()
+    audio = np.ones((10, 2))
+    taps["a"] = audio
+
+    assert taps["a"] is audio and taps.file is None
+
+
+def test_a_failed_spill_gives_back_what_it_wrote_and_stays_counted(monkeypatch):
+    monkeypatch.setattr(spill, "RESIDENT", 0)
+    real = spill.os.pwrite
+    calls = []
+
+    def short(fd, data, offset):
+        calls.append(offset)
+        if len(calls) % 2:
+            return real(fd, data[:8], offset)
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(spill.os, "pwrite", short)
+    taps = spill.Taps()
+    for name in "abc":
+        taps[name] = np.full((10, 2), ord(name), float)
+
+    assert set(taps.resident) == {"a", "b", "c"} and not taps.spilled
+    assert spill._HELD[0] == 3 * 160 and len(spill._LRU) == 3
+    assert spill.os.fstat(taps.file.fileno()).st_size == 0
+    monkeypatch.setattr(spill.os, "pwrite", real)
+    taps["d"] = np.zeros((10, 2))
+
+    assert not taps.resident and spill._HELD[0] == 0
+    assert taps["b"].tobytes() == np.full((10, 2), ord("b"), float).tobytes()
+
+
+def test_the_taps_held_at_a_peak_are_what_was_held_then_not_the_budget(monkeypatch):
+    rss = [100]
+    monkeypatch.setattr(spill.resource, "getrusage", lambda who: SimpleNamespace(ru_maxrss=rss[0]))
+    monkeypatch.setattr(spill, "BUDGET", 1 << 30)
+    taps = spill.Taps()
+    taps["a"] = np.zeros((10, 2))
+    rss[0] = 200
+    taps["b"] = np.zeros((10, 2))
+
+    assert spill.held_at_peak() == 160
+
+
 def test_only_the_last_used_taps_stay_in_memory(monkeypatch):
     monkeypatch.setattr(spill, "RESIDENT", 2)
     monkeypatch.setattr(spill, "BUDGET", 0)

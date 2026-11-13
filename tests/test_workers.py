@@ -352,8 +352,9 @@ def test_cold_warm_and_partly_cached_checks_with_workers_match_one_process(tmp_p
         assert check(tmp_path, recipe, False, 2, monkeypatch, tmp_path / "memo") == alone
 
 
-def test_taps_a_worker_held_within_its_budget_dont_raise_the_estimate(tmp_path):
-    signal, taps, held = 10 << 20, 20, 2 << 30
-    workers.record(tmp_path, signal, taps, [workers.BASE_BYTES + held + signal * taps], held)
+def test_a_workers_unused_budget_never_lowers_its_recorded_peak(tmp_path):
+    # A worker allowed 1 GiB of taps that held none: its whole peak over the base is working set.
+    signal, taps = 1 << 20, 100
+    workers.record(tmp_path, signal, taps, [workers.BASE_BYTES + 400 * signal])
 
-    assert workers.estimate(tmp_path, signal, taps) == workers.BASE_BYTES + workers.TAP_SIGNALS * signal * taps
+    assert workers.estimate(tmp_path, signal, taps) == workers.BASE_BYTES + 4 * signal * taps

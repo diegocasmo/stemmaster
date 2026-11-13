@@ -105,14 +105,14 @@ def budget(need, n, keep=0, share=BUDGET_SHARE, free=None, total=None):
     return int(keep + max(0, share * (spare / n - need)))
 
 
-def record(cache, signal_bytes, taps, peaks, held=0):
-    """Keeps this song's largest worker peak per tapped signal, leaving out the taps its budget let it hold.
-    Bookkeeping only: it never fails the check."""
+def record(cache, signal_bytes, taps, peaks):
+    """Keeps this song's largest worker peak per tapped signal; each peak leaves out only the taps held in memory when
+    it was reached. Bookkeeping only: it never fails the check."""
     import evidence
 
     try:
         if peaks and signal_bytes * taps:
-            per_signal = max(recorded(cache), (max(peaks) - held - BASE_BYTES) / (signal_bytes * taps))
+            per_signal = max(recorded(cache), (max(peaks) - BASE_BYTES) / (signal_bytes * taps))
             evidence.write_atomic(cache / PEAKS, json.dumps({FACTOR: per_signal, "peak_bytes": max(peaks)}))
     except Exception as error:
         evidence.progress(f"workers: peak not recorded: {error}")
@@ -193,8 +193,8 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                     # The check meets the same error itself, in its own order, when it computes this part.
                     evidence.progress(f"workers stopped: {type(future.exception()).__name__}: {future.exception()}")
                     return
-                peak, seconds = future.result()
-                peaks.append(peak)
+                peak, seconds, kept = future.result()
+                peaks.append(peak - kept)
                 done += 1
                 evidence.progress(f"workers: {done}/{len(todo)} parts ({names[future]}... {seconds:.0f} s), worker peak {peak >> 20} MB")
                 if waiting:
@@ -212,7 +212,7 @@ def prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx):
                 pool.shutdown(wait=True, cancel_futures=True)
             except Exception as error:
                 evidence.progress(f"workers: shutdown failed: {error}")
-        record(variants.cache, signal_bytes, taps, peaks, held)
+        record(variants.cache, signal_bytes, taps, peaks)
 
 
 def _start(recipe, song, nodes, master_mode, planned, outside, held):
@@ -238,6 +238,7 @@ def _start(recipe, song, nodes, master_mode, planned, outside, held):
 
 def _run(contracts, published):
     import evidence
+    import spill
 
     state, started = _STATE, time.monotonic()
     if "refused" in state:
@@ -250,4 +251,4 @@ def _run(contracts, published):
     # Only the current render is shared between parts; the rest would hold memory the next part needs.
     for key in [k for k in variants.views if k != "current"]:
         variants.drop(key)
-    return peak_bytes(), time.monotonic() - started
+    return peak_bytes(), time.monotonic() - started, spill.held_at_peak()
