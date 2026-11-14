@@ -371,9 +371,10 @@ def check_trial(recipe, song, record, bullets, label, errors, notes):
         errors.append(f"{label}: an always-tried move is judged by the check's own starting trial; drop the trial")
         return
     _, field_kinds = chain_docs.tools(bullets)
-    # A move whose Tool is a send (snare.reverb, toms.reverb) is tried by its send alone.
+    # A move whose Tool is a send (snare.reverb, toms.reverb) is tried by its send alone, into a reverb already there. A
+    # trial with steps of its own (a parallel bus with its compressor) is judged by those steps like any other.
     by_send = isinstance(patch, dict) and "sends" in field_kinds and isinstance(patch.get("sends"), dict) \
-        and any(isinstance(sends, list) and sends for sends in patch["sends"].values())
+        and any(isinstance(sends, list) and sends for sends in patch["sends"].values()) and not patch.get("steps")
     if not isinstance(patch, dict) or set(patch) - PATCH_FIELDS or not (patch.get("steps") or by_send):
         errors.append(f"{label}: trial needs steps (or sends, for a send move), and only {sorted(PATCH_FIELDS)}")
         return
@@ -398,9 +399,9 @@ def check_trial(recipe, song, record, bullets, label, errors, notes):
     plugins, _ = chain_docs.tools(bullets)
     if not by_send and not any(identity(step) in plugins for step in patch["steps"]):
         errors.append(f"{label}: trial needs a step from the move's Tool list")
-    if by_send:
+    if by_send or "reverb" in record["move"].split(".", 1)[1]:
         reverbs = {step["target"] for step in variant.get("steps", []) if any(w in step["plugin"] for w in ("Reverb", "EarlyReflections"))}
-        for name, sends in patch["sends"].items():
+        for name, sends in patch.get("sends", {}).items():
             if any(send.get("bus") not in reverbs for send in sends):
                 errors.append(f"{label}: a send trial must feed a reverb return")
     off_list = [step.get("id") for step in patch.get("steps", []) if identity(step) not in plugins and step.get("plugin") != "Gain"]

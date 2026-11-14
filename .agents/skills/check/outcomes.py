@@ -276,7 +276,11 @@ class Context:
 UNREAD = "(no single point)"
 
 
-def acting_point(recipe, routing, step_ids, node, own_stems, chain_stems=None):
+# Moves whose processing sits on a return the source sends to, beside its dry path: what they change is the two summed.
+PARALLEL_MOVES = {"drum-bus.parallel", "drum-bus.distort-parallel", "bass.split"}
+
+
+def acting_point(recipe, routing, step_ids, node, own_stems, chain_stems=None, parallel=False):
     """The one bus a move's processing acts on when that is not the source's node: a shared bus past it (the tom-bus
     compressor) or a group inside it (a rhythm-guitar bus). Gain steps only change level, so they don't choose it."""
     if node is None:
@@ -289,15 +293,21 @@ def acting_point(recipe, routing, step_ids, node, own_stems, chain_stems=None):
     # target routes into.
     chains = {t: ([] if t == "mix" else [t] + (routing.path(t) if t in recipe["stems"] else ancestors(recipe, t)))
               for t in targets}
+    # A parallel move's return (a split bass's growl) is half of what it does: read it with the dry node, where they meet.
+    own_chain = [node] + (routing.path(node) if node in recipe["stems"] else ancestors(recipe, node))
+    if parallel and any(t != "mix" and node not in chains[t] and t not in own_chain for t in targets):
+        targets, chains = targets | {node}, chains | {node: own_chain}
     last = [t for t in targets if all(t in chains[other] for other in targets)]
     if len(last) != 1:
         # Parallel paths: read where they all meet, or at the node if it already sums them; else nothing reads them all.
         first = next(iter(targets))
-        meet = next((bus for bus in chains[first] if all(bus in chains[other] for other in targets)), None)
+        meet = next((bus for bus in chains[first] + ["mix"] if all(bus in chains[other] + ["mix"] for other in targets)), None)
         if meet is None and all(node in chains[t] or t == node for t in targets):
             return None
         if meet is None:
             return UNREAD
+        if meet == "mix":
+            chains = {t: chain + ["mix"] for t, chain in chains.items()}
         chain_stems = set(chain_stems or own_stems)
         if not routing.stems_into(meet) <= chain_stems:
             # The meeting bus carries other parts (a drums bus): read the sum of its inputs on the claimed paths,

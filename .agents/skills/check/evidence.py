@@ -657,7 +657,8 @@ def contract_taps(ctx, records):
             for role in ("lead", "rhythm"):
                 taps |= set(outcome_tools.point_names(ctx, role, record["source"]) or [])
         acting = outcome_tools.acting_point(ctx.recipe, ctx.routing, record.get("steps", []), ctx.nodes.get(record["source"]),
-                                            ctx.sources.get(record["source"], {}).get("stems", []), chain_stems(ctx, record["source"]))
+                                            ctx.sources.get(record["source"], {}).get("stems", []), chain_stems(ctx, record["source"]),
+                                            record.get("move") in outcome_tools.PARALLEL_MOVES)
         taps |= set(acting) if isinstance(acting, tuple) else {acting}
         steps = {step.get("id"): step for step in ctx.recipe.get("steps", []) + record.get("trial", {}).get("steps", [])}
         taps |= {steps[i]["target"] for i in record.get("steps", []) + [t.get("id") for t in record.get("trial", {}).get("steps", [])] if i in steps}
@@ -861,7 +862,7 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
         trial_ids = [step["id"] for step in record.get("trial", {}).get("steps", [])] or entry.get("probed", [])
         ctx.acting = outcome_tools.acting_point(judged_recipe, Routing(judged_recipe), record.get("steps", []) + trial_ids,
                                                 ctx.nodes.get(record["source"]), ctx.sources.get(record["source"], {}).get("stems", []),
-                                                chain_stems(ctx, record["source"]))
+                                                chain_stems(ctx, record["source"]), record["move"] in outcome_tools.PARALLEL_MOVES)
         ctx.join_recipe = variants.recipes[keys["with"]] if "with" in keys else None
         ctx.record = record
         ctx.trial_ids = trial_ids + ([entry["match"]] if entry.get("match") else [])
