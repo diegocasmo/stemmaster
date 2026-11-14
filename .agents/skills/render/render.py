@@ -598,9 +598,9 @@ class Mix:
     without buses, sends or keys keep their exact samples. A keyed step pulls its key forward.
     """
 
-    def __init__(self, recipe, song, rate, length, taps=(), probes=None, memo=None):
+    def __init__(self, recipe, song, rate, length, taps=(), probes=None, memo=None, tapped=None):
         self.recipe, self.song, self.rate, self.length = recipe, song, rate, length
-        self.taps, self.tapped = set(taps), {}
+        self.taps, self.tapped = set(taps), {} if tapped is None else tapped
         self.probes, self.probed = probes or {}, {}
         self.sections = recipe.get("sections", {})
         self.steps = [step for step in recipe.get("steps", []) if step.get("stage", "mix") == "mix"]
@@ -702,12 +702,12 @@ def measure(audio, rate):
 
 
 class Result:
-    def __init__(self, recipe, song, taps=(), strict=True, boundary=None, probes=None, memo=None):
+    def __init__(self, recipe, song, taps=(), strict=True, boundary=None, probes=None, memo=None, tapped=None):
         self.rate, length = timeline(recipe, song)
         check(recipe, self.rate, length, strict)
         if unknown := set(taps) - set(sources(recipe)) - {MASTER_IN}:
             sys.exit(f"--tap names no stem or bus: {sorted(unknown)}")
-        self.mixer = Mix(recipe, song, self.rate, length, taps, probes, memo)
+        self.mixer = Mix(recipe, song, self.rate, length, taps, probes, memo, tapped)
         self.mix = self.mixer.render()
         self.tapped = self.mixer.tapped
         self.master_steps = [step for step in recipe.get("steps", []) if step.get("stage") == "master"]

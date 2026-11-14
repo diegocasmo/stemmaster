@@ -493,3 +493,10 @@ def test_a_shared_drop_group_removes_all_its_claims_before_pruning_returns(song)
     assert len(changes) == 2 and left == []
     assert new["buses"] == {"toms": {"bus": "drums"}, "drums": {}} and new["steps"] == []
     assert check.renders(new, song, False) == []
+
+
+def test_a_field_names_only_its_own_stem_or_bus():
+    recipe = {"stems": {"Snare.wav": {}, "Snare": {}}, "buses": {"Snare": {}, "verb": {}}}
+
+    assert defaults.field_names(recipe, ["stems.Snare.wav.offset_samples"]) == {"Snare.wav"}
+    assert defaults.field_names(recipe, ["buses.Snare.sends.verb", "stems.Snare.pan"]) == {"Snare"}

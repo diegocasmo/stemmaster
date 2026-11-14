@@ -111,3 +111,10 @@ def test_codex_context_with_the_repo_agents_file_passes(transcripts, tmp_path, m
     head = f"# AGENTS.md instructions for {review.REPO}\n\n<INSTRUCTIONS>\n{agents}\n\n</INSTRUCTIONS>\n"
 
     assert transcripts(codex_entries=codex(environment=head + ENVIRONMENT)) == []
+
+
+def test_the_mix_fingerprint_binds_stem_order():
+    mix = {"stems": {"a.wav": {"gain_db": 0}, "b.wav": {"gain_db": -3}}}
+    swapped = {"stems": dict(reversed(mix["stems"].items()))}
+    assert review.fingerprint(mix, ["inputs"]) == review.fingerprint(json.loads(json.dumps(mix)), ["inputs"])
+    assert review.fingerprint(mix, ["inputs"]) != review.fingerprint(swapped, ["inputs"])

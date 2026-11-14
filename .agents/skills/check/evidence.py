@@ -24,6 +24,7 @@ from memo import memoized
 import contracts
 import incremental
 import outcomes as outcome_tools
+import spill
 import workers
 from structure import CLAIMED_FIELDS, DRUM_CHAINS, Routing, apply_patch, fields_of, roles_of as structure_roles
 
@@ -44,7 +45,7 @@ CODE = [ROOT / ".agents" / "skills" / path for path in (
     "render/render.py", "render/native.py", "render/airwindows.py", "render/prepared.py",
     "analyze/analyze.py", "analyze/hits.py", "analyze/measure.py", "analyze/memo.py", "analyze/notes.py", "align/align.py",
     "check/evidence.py", "check/structure.py", "check/chains.py", "check/contracts.py", "check/outcomes.py",
-    "check/workers.py", "check/incremental.py",
+    "check/workers.py", "check/incremental.py", "check/spill.py",
 )]
 
 
@@ -204,23 +205,39 @@ def loudness(audio, rate):
 
 def matched_master(result, target):
     """Finds the mix gain that brings the trial to `target` LUFS, bracketing it so a compressor can't stall the search."""
+    ids = {step.get("id") for step in result.master_steps}
+
     def trial(gain_db):
         master_in, out = result.master(result.mix * 10 ** (gain_db / 20))
-        return master_in, out, loudness(out, result.rate) - target
+        probed = {key: value for key, value in result.mixer.probed.items() if key in ids}
+        return master_in, out, loudness(out, result.rate) - target, probed
 
-    tried = {0.0: trial(0.0)}
+    def score(error):
+        return abs(error) if np.isfinite(error) else np.inf
+
+    def tried(gain):
+        # Only the best trial's signals are kept, each round's being two whole-song signals. A tie goes to the gain
+        # tried first, as min() over every trial in order would pick.
+        nonlocal best
+        made = trial(gain)
+        if best is None or score(made[2]) < score(best[1][2]):
+            best = gain, made
+        return made[2]
+
+    best = None
+    error = tried(0.0)
     low, high, gain = -np.inf, np.inf, 0.0
     for _ in range(MATCH_ROUNDS):
-        error = tried[gain][2]
         if not np.isfinite(error) or abs(error) <= MATCH_LU:
             break
         low, high = (low, min(high, gain)) if error > 0 else (max(low, gain), high)
         gain = gain - error
         if not low < gain < high:
             gain = (low + high) / 2
-        tried[gain] = trial(gain)
-    best = min(tried, key=lambda g: abs(tried[g][2]) if np.isfinite(tried[g][2]) else np.inf)
-    master_in, out, error = tried[best]
+        error = tried(gain)
+    best, (master_in, out, error, probed) = best
+    # Each pass rewrote the master steps' probes, so the best drive's come back: the last tried may not be the best.
+    result.mixer.probed.update(probed)
     return {"drive_change_db": round(best, 2), "residual_lu": measure.rounded(error),
             "matched": bool(np.isfinite(error) and abs(error) <= MATCH_LU)}, master_in, out
 
@@ -242,6 +259,25 @@ def observe(audio, rate, hits, sections):
     return entry
 
 
+# Keys no stem or bus can have: a render's mix and trial master are kept with its taps.
+MIX, MASTER_IN, TRIAL = ("mix",), ("master-in",), ("trial",)
+
+
+class Rendered:
+    """A render whose mix is kept with its taps."""
+
+    def __init__(self, result):
+        self._result = result
+        result.tapped[MIX] = result.__dict__.pop("mix")
+
+    def __getattr__(self, name):
+        return getattr(self._result, name)
+
+    @property
+    def mix(self):
+        return self._result.tapped[MIX]
+
+
 class Master:
     """A render's trial master, made on first read: matching it to the target runs the master chain several times."""
 
@@ -249,18 +285,21 @@ class Master:
         self.result, self.target, self.made = result, target, None
 
     def make(self):
-        if self.made is None:
-            with incremental.quiet():
-                self._make()
-        return self.made
+        with incremental.quiet():
+            return self._make()
 
     def _make(self):
         if self.made is None:
             if self.target is None:
                 master_in, trial = self.result.master(self.result.mix)
-                self.made = {"drive_change_db": 0.0, "matched": False}, master_in, trial
+                numbers = {"drive_change_db": 0.0, "matched": False}
             else:
-                self.made = matched_master(self.result, self.target)
+                numbers, master_in, trial = matched_master(self.result, self.target)
+            # Kept with the render's taps, so they go to disk with them while other signals are read.
+            self.result.tapped[MASTER_IN], self.result.tapped[TRIAL] = master_in, trial
+            self.made = numbers
+            return numbers, master_in, trial
+        return self.made, self.result.tapped[MASTER_IN], self.result.tapped[TRIAL]
 
     def get(self, name):
         if not self.result.master_steps:
@@ -268,8 +307,9 @@ class Master:
         # An unmatched master is never read, so it is made only for the battery's numbers.
         if name == "matched" and self.target is None:
             return False
-        numbers, master_in, trial = self.make()
-        return {"matched": numbers["matched"], "trial": trial, "master-in": master_in}[name]
+        if self.made is None:
+            self.make()
+        return self.made["matched"] if name == "matched" else self.result.tapped[{"trial": TRIAL, "master-in": MASTER_IN}[name]]
 
 
 def battery(recipe, result, points, times, chain_nodes, master):
@@ -465,13 +505,14 @@ class Variants:
                  "Delay": functools.partial(outcome_tools.engagement, align=False)}
         probes = {step_id: probe.get(plugins.get(step_id), outcome_tools.engagement) for step_id in self.probes.get(key, {})}
         taps = sorted(({tap for tap, _ in self.layout[0].values()} | self.taps) & set(render.sources(variant)))
-        result = render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary, probes=probes,
-                               memo=self.memo)
+        result = Rendered(render.Result(variant, self.song, taps, strict=variant is self.recipe, boundary=self.boundary,
+                                        probes=probes, memo=self.memo, tapped=spill.Taps()))
         points, _, chain_nodes = self.layout
         # A battery reads every observation tap, so a variant that loses one fails here even when none is measured.
         for tap in [tap for tap, _ in points.values()] + [node for first, second, _, _ in OVERLAPS for chain in (first, second)
                                                           for node in chain_nodes.get(chain, [])]:
-            result.tapped[tap]
+            if tap not in result.tapped:
+                raise KeyError(tap)
         master = Master(result, self.target)
         if set(probes) & {step.get("id") for step in result.master_steps}:
             # Each master pass rewrites its steps' probes, so the matched master runs first, before any other pass.
@@ -973,6 +1014,12 @@ def contract_report(recipe, song, nodes, variants, ctx, master_mode, only=None):
         if found is not None:
             write_atomic(trace_path(variants, master_mode, record), incremental.seal(found))
         out.append(verdict(entry, evaluated))
+        # Readings are cached per record, and no record is read twice, so the current view would keep every record's.
+        for view in [*variants.views.values(), *entry.get("views", {}).values()]:
+            for one in view if isinstance(view, list) else [view]:
+                if isinstance(one, outcome_tools.View):
+                    for cached in [k for k in one.cache if k[2] == id(record)]:
+                        del one.cache[cached]
         entry.pop("views")
     order = {(r["move"], r["source"]): i for i, r in enumerate(records)}
     return sorted(out, key=lambda r: order[(r["move"], r["source"])])
@@ -1061,6 +1108,10 @@ def measured(recipe, song, nodes, master_mode=False):
     progress(f"report on {sum(r.get('move') != 'balance' for r in recipe.get('moves', []))} moves")
     promote(recipe, variants, ctx, master_mode)
     workers.prewarm(recipe, song, nodes, master_mode, planned, outside, variants, ctx)
+    # Set after the workers are gone, so this process's taps get all the memory above the floor its estimate leaves;
+    # free memory dropping during the run sends them to disk.
+    spill.BUDGET = workers.budget(workers.estimate(cache, *workers.sizes(recipe, variants, ctx)), 1, share=1)
+    spill.FREE, spill.FLOOR = workers.free_fraction, workers.SPILL_FLOOR
     timing_stems, counts = planned[3], planned[4]
     contract = contract_report(recipe, song, nodes, variants, ctx, master_mode)
     current = variants.battery("current")

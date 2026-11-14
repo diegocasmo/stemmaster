@@ -1620,7 +1620,23 @@ def m_blend_shortfall(view, source, args):
             variant = copy.deepcopy(recipe)
             variant["stems"][stem].update(offset_samples=offset, invert=invert)
             worst = max(worst, whole(variant) - current)
+    apart = split_returns(view.ctx.recipe, set(names))
+    if apart:
+        return Review(worst, f"{', '.join(apart)} carry only part of the blend to the mix, which the dry blend's sum "
+                             "can't show: judge whether they cancel it", floor=True)
     return worst
+
+
+def split_returns(recipe, names):
+    """Returns some of the blend's mics reach apart from the rest: a path the mix hears that the dry blend's score leaves
+    out. Only a send from a node already carrying the whole blend keeps its proportions; a send per mic need not."""
+    routing = Routing(recipe)
+    found = []
+    for sender, settings in list(recipe["stems"].items()) + list(recipe.get("buses", {}).items()):
+        carried = ({sender} if sender in recipe["stems"] else routing.stems_into(sender)) & names
+        if carried and carried != names:
+            found += [send["bus"] for send in settings.get("sends", []) if send["bus"] not in found]
+    return found
 
 
 MEASURES = {name[2:]: value for name, value in dict(globals()).items() if name.startswith("m_")}
