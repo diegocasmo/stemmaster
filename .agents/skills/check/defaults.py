@@ -264,9 +264,15 @@ def decide(recipe, numbers, variants, master_only=False, validate=None):
 
 
 def field_names(recipe, fields):
-    """The stems and buses fields name: stem names hold dots ("Snare.wav"), so a field names the one it starts with."""
-    known = list(recipe["stems"]) + list(recipe.get("buses", {}))
-    return {name for field in fields for name in known if field.split(".", 1)[1].startswith(f"{name}.")}
+    """The stems and buses fields name. Stem names hold dots ("Snare.wav"), so the name is what comes before the
+    field's own key or `.sends.`, read the way off_variant reads it."""
+    found = set()
+    for field in fields:
+        kind, rest = field.split(".", 1)
+        name = rest.split(".sends.")[0] if ".sends." in rest else rest.rsplit(".", 1)[0]
+        if name in (recipe["stems"] if kind == "stems" else recipe.get("buses", {})):
+            found.add(name)
+    return found
 
 
 def nodes_of(recipe, kind, records, patches):
