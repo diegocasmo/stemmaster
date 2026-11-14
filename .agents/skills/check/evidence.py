@@ -109,32 +109,32 @@ def record_part(record):
 LEVEL_PLUGINS = ("Gain", "Ride", "Duck")
 
 
-def feeders(recipe):
-    found = {}
-    for name, settings in list(recipe["stems"].items()) + list(recipe.get("buses", {}).items()):
-        found.setdefault(settings.get("bus", "mix"), set()).add(name)
-        for send in settings.get("sends", []):
-            found.setdefault(send["bus"], set()).add(name)
-    return found
+def wet_buses(recipe):
+    """Buses that carry only what sends feed in: a send's return and the buses after it, by route or send, until a
+    route brings in dry signal."""
+    entries = list(recipe["stems"].items()) + list(recipe.get("buses", {}).items())
+    routed, sent = {}, {send["bus"] for _, settings in entries for send in settings.get("sends", [])}
+    for name, settings in entries:
+        routed.setdefault(settings.get("bus", "mix"), set()).add(name)
+    wet = set(recipe.get("buses", {}))
+    while True:
+        # A stem is never wet, so a bus a stem routes into drops out, and so does every bus a dropped bus routes into.
+        kept = {bus for bus in wet if (bus in sent or routed.get(bus)) and routed.get(bus, set()) <= wet}
+        if kept == wet:
+            return wet
+        wet = kept
 
 
-def returns_from(recipe):
-    """Buses fed only by sends."""
-    routed = {settings.get("bus", "mix") for settings in list(recipe["stems"].values()) + list(recipe.get("buses", {}).values())}
-    return [bus for bus in dict.fromkeys(send["bus"] for settings in list(recipe["stems"].values()) + list(recipe.get("buses", {}).values())
-                                         for send in settings.get("sends", [])) if bus not in routed]
-
-
-def return_chain(recipe, bus):
-    """A return and what it feeds, by route or send, that nothing else feeds: what only the return's signal passes through."""
-    chain, into, todo = {bus}, feeders(recipe), [bus]
+def wet_region(recipe, bus, wet):
+    """The wet buses a send into `bus` passes through before it joins dry signal."""
+    region, todo = {bus}, [bus]
     while todo:
         settings = recipe.get("buses", {}).get(todo.pop(), {})
         for following in [settings.get("bus", "mix")] + [send["bus"] for send in settings.get("sends", [])]:
-            if following != "mix" and following not in chain and into.get(following, set()) <= chain:
-                chain.add(following)
+            if following in wet and following not in region:
+                region.add(following)
                 todo.append(following)
-    return chain
+    return region
 
 
 def off_variant(recipe, record):
@@ -151,16 +151,23 @@ def off_variant(recipe, record):
             name, key = rest.rsplit(".", 1)
             if key in CLAIMED_FIELDS:
                 entries[name].pop(key, None)
-    # A send-only return the record leaves with nothing but level on it, down to where other parts join, would pass its
-    # sends through dry, so every send into it is muted, even ones the record can't claim.
-    removed = {step["target"] for step in recipe.get("steps", []) if step.get("id") in claimed}
-    for bus in returns_from(variant):
-        chain = return_chain(variant, bus)
-        wet = any(step["target"] in chain and step["plugin"] not in LEVEL_PLUGINS for step in variant["steps"])
-        if chain & removed and not wet:
-            for settings in list(variant["stems"].values()) + list(variant.get("buses", {}).values()):
-                if any(send["bus"] == bus for send in settings.get("sends", [])):
-                    settings["sends"] = [send for send in settings["sends"] if send["bus"] != bus]
+    return variant
+
+
+def measured_off(recipe, record):
+    """The render a kept record is measured against: its off variant, with every send muted whose wet path the record
+    leaves with no effect, even one it can't claim, since that path would pass its input through dry. What a drop
+    writes into the recipe stays off_variant, so a drop never edits another record's claims."""
+    variant = off_variant(recipe, record)
+    # Read on the recipe as it is, so a feeder the record's own sends left silent can't make a wet path look dry.
+    wet = wet_buses(recipe)
+    steps = {step.get("id"): step for step in recipe.get("steps", [])}
+    removed = {steps[i]["target"] for i in record.get("steps", []) if i in steps and steps[i]["plugin"] not in LEVEL_PLUGINS}
+    effects = {step["target"] for step in variant["steps"] if step["plugin"] not in LEVEL_PLUGINS}
+    dry = {bus for bus in wet if (region := wet_region(recipe, bus, wet)) & removed and not region & effects}
+    for settings in list(variant["stems"].values()) + list(variant.get("buses", {}).values()):
+        if any(send["bus"] in dry for send in settings.get("sends", [])):
+            settings["sends"] = [send for send in settings["sends"] if send["bus"] not in dry]
     return variant
 
 
@@ -778,7 +785,7 @@ def judge(entry, needed_leaves, worked_leaves, needed, worked):
 
 
 def off_key(recipe, record):
-    return recipe_key(off_variant(recipe, record))
+    return recipe_key(measured_off(recipe, record))
 
 
 def recipe_key(variant):
@@ -797,7 +804,7 @@ def contract_entries(recipe, variants, ctx, master_mode):
     for record in records:
         entry = {"record": record, "contract": contracts.CONTRACTS[record["move"]], "keys": {}}
         if record.get("decision") in ("kept", "changed"):
-            key = variants.add(off_key(recipe, record), off_variant(recipe, record))
+            key = variants.add(off_key(recipe, record), measured_off(recipe, record))
             entry["keys"] = {"base": key, "with": "current", "without": key}
             for step_id in record.get("steps", []):
                 variants.probes.setdefault("current", {})[step_id] = "probe"
