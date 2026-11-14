@@ -656,9 +656,13 @@ def contract_taps(ctx, records):
             # Lead and rhythm readings sum each role's own outputs, which no leaf names directly.
             for role in ("lead", "rhythm"):
                 taps |= set(outcome_tools.point_names(ctx, role, record["source"]) or [])
-            # The pair reads the rhythms on a render without their sends where those keep them from being read alone.
-            dry = outcome_tools.without_sends(ctx.recipe, outcome_tools.role_stems(ctx, record["source"], "rhythm"))
-            taps |= set(outcome_tools.rhythm_path(ctx, record["source"], "rhythm", dry) or [])
+            # The pair reads the rhythms on a render without their sends where those keep them from being read alone,
+            # in the recipe and in the record's trial or off render, which can add or drop a rhythm bus of its own.
+            rhythm = outcome_tools.role_stems(ctx, record["source"], "rhythm")
+            other = trial_variant(ctx.recipe, record, ctx)[0] if record.get("decision") == "dropped" else off_variant(ctx.recipe, record)
+            for variant in [ctx.recipe] + ([other] if other is not None else []):
+                dry = outcome_tools.without_shared_sends(variant, rhythm)
+                taps |= set(outcome_tools.rhythm_path(ctx, record["source"], "rhythm", dry) or [])
         acting = outcome_tools.acting_point(ctx.recipe, ctx.routing, record.get("steps", []), ctx.nodes.get(record["source"]),
                                             ctx.sources.get(record["source"], {}).get("stems", []), chain_stems(ctx, record["source"]))
         taps |= set(acting) if isinstance(acting, tuple) else {acting}

@@ -143,6 +143,49 @@ def test_a_duck_the_rhythm_sends_key_makes_the_dry_pair_a_question(song):
     assert isinstance(lr(recipe, song), outcomes.Review)
 
 
+def test_a_trials_own_rhythm_bus_is_tapped_too(song):
+    recipe = shared_verb(guitars(song))
+    trial = {"buses": {"trial-rhythms": {"bus": "gtr"}}, "routing": {"GtrL.wav": "trial-rhythms", "GtrR.wav": "trial-rhythms"},
+             "steps": [{"id": "trial-eq", "target": "GtrL.wav", "plugin": "PeakFilter",
+                        "settings": {"cutoff_frequency_hz": 2000, "gain_db": -2, "q": 1}}]}
+    record = {"move": "guitars.side-tones", "source": "guitars", "decision": "dropped", "trial": trial}
+
+    assert "trial-rhythms" in evidence.contract_taps(view(recipe, song).ctx, [record])
+
+
+def test_a_duck_keyed_after_a_dropped_send_makes_the_dry_pair_a_question(song):
+    recipe = guitars(song)
+    # The right rhythm reaches the key both directly and through the verb it sends to.
+    recipe["stems"]["GtrR.wav"].update(bus="right-key", sends=[{"bus": "verb"}])
+    recipe["stems"]["GtrLead.wav"]["sends"] = [{"bus": "verb"}]
+    recipe["buses"] |= {"verb": {"bus": "right-key"}, "right-key": {"bus": "gtr"}}
+    recipe["steps"] = [{"id": "duck", "target": "GtrL.wav", "plugin": "Duck",
+                        "settings": {"key": "right-key", "threshold_db": -10, "ratio": 20, "range_db": 12,
+                                     "attack_ms": 0, "release_ms": 100}}]
+
+    assert isinstance(lr(recipe, song), outcomes.Review)
+
+
+def test_a_rhythm_only_return_stays_in_the_dry_pair(song):
+    recipe = shared_verb(guitars(song))
+    recipe["buses"]["right-return"] = {"bus": "gtr"}
+    recipe["stems"]["GtrR.wav"]["sends"].append({"bus": "right-return", "gain_db": 6})
+
+    assert not_a_pass(lr(recipe, song))
+
+
+def test_the_check_taps_a_rhythm_return_an_off_render_keeps(song):
+    recipe = shared_verb(guitars(song))
+    recipe["buses"] |= {"own-return": {"bus": "own-exit"}, "own-exit": {}}
+    recipe["stems"]["GtrR.wav"]["sends"].append({"bus": "own-return", "gain_db": -12})
+    recipe["steps"] = [{"id": "eq", "target": "GtrL.wav", "plugin": "PeakFilter",
+                        "settings": {"cutoff_frequency_hz": 2000, "gain_db": -2, "q": 1}}]
+    record = {"move": "guitars.side-tones", "source": "guitars", "decision": "changed", "steps": ["eq"],
+              "fields": ["stems.GtrL.wav.sends.verb", "stems.GtrR.wav.sends.verb"]}
+
+    assert "own-exit" in evidence.contract_taps(view(recipe, song).ctx, [record])
+
+
 def test_lead_gap_with_a_lead_only_delay(song):
     recipe = guitars(song)
     recipe["buses"]["delay"] = {}

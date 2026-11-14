@@ -411,6 +411,26 @@ def without_sends(recipe, stems):
     return variant
 
 
+def without_shared_sends(recipe, stems):
+    """The recipe without the sends from a node carrying only these stems into a bus that also carries other parts:
+    their own returns stay, since the role is read with them."""
+    import copy
+
+    routing = Routing(recipe)
+    nodes = render.sources(recipe)
+    shared = {name: [send for send in settings.get("sends", []) if not routing.stems_into(send["bus"]) <= stems]
+              for name, settings in nodes.items()
+              if ({name} if name in recipe["stems"] else routing.stems_into(name) or {None}) <= stems}
+    if not any(shared.values()):
+        return recipe
+    variant = copy.deepcopy(recipe)
+    for name, drop in shared.items():
+        if drop:
+            entry = variant["stems"].get(name) or variant["buses"][name]
+            entry["sends"] = [send for send in entry["sends"] if send not in drop]
+    return variant
+
+
 def lead_wet_joins(ctx, source, recipe):
     """The recipe without the lead's sends, and the lead-only buses on its dry path that a return it feeds reaches,
     through the return's parents or its sends."""
@@ -1070,12 +1090,23 @@ def dry_rhythms(view, source, args):
     recipe = view.recipe or view.ctx.recipe
     if args.get("point") != "rhythm" or view.twin is None or rhythm_path(view.ctx, source, "rhythm", recipe) is not None:
         return view, []
-    dry = without_sends(recipe, role_stems(view.ctx, source, "rhythm"))
+    dry = without_shared_sends(recipe, role_stems(view.ctx, source, "rhythm"))
     if dry is recipe:
         return view, []
-    wet, bare = Routing(recipe), Routing(dry)
+    # Any key downstream of a dropped send hears less, even one the same stems still reach another way.
+    nodes, kept = render.sources(recipe), render.sources(dry)
+    todo = [send["bus"] for name, settings in nodes.items() for send in settings.get("sends", [])
+            if send not in kept.get(name, {}).get("sends", [])]
+    downstream = set()
+    while todo:
+        node = todo.pop()
+        if node in downstream or node == "mix":
+            continue
+        downstream.add(node)
+        settings = nodes.get(node, {})
+        todo += [settings.get("bus", "mix")] + [send["bus"] for send in settings.get("sends", [])]
     keys = sorted({step["settings"]["key"] for step in recipe.get("steps", []) if step.get("plugin") == "Duck"
-                   and wet.stems_into(step["settings"]["key"]) != bare.stems_into(step["settings"]["key"])})
+                   and step["settings"]["key"] in downstream})
     return view.twin(dry), keys
 
 
