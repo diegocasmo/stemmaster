@@ -224,20 +224,37 @@ def test_a_small_songs_peak_keeps_the_estimate_scaling_with_length(tmp_path, mon
     workers.record(tmp_path, 44100 * 16, 1, [172 << 20])
 
     assert workers.estimate(tmp_path, signal, taps) == before
-    assert workers.count(20, before, free=0.8, total=16 * GB, cpus=8) == 1
+    assert workers.count(20, before, free=0.8, total=16 * GB, cpus=8) == 2
 
 
-# Song 000's 90 s cut: 26 tapped signals of 63.8 MB, a measured worker peak of 4.41 GB.
+# Song 000's 90 s cut: 26 tapped signals of 63.8 MB. Its worker peaked at 4.41 GB with every tap held; synthetic
+# songs project 1.6 to 1.8 GB with taps on disk.
 SONG_SIGNAL, SONG_TAPS = round(90.457 * 44100) * 16, 26
 
 
-@pytest.mark.parametrize("free, expected", [(0.9, 2), (1.0, 2), (0.8, 1)])
-def test_a_90_s_song_on_16_gb_gets_two_workers_when_they_fit(tmp_path, monkeypatch, free, expected):
+@pytest.mark.parametrize("spill, free, expected", [
+    (None, 1.0, 2), (None, 0.87, 2), (None, 0.7, 1),
+    ("1", 1.0, 5), ("1", 0.87, 4), ("1", 0.7, 3), ("1", 0.65, 2), ("1", 0.4, 1),
+], ids=lambda value: f"{value}")
+def test_a_90_s_song_on_16_gb_gets_workers_that_keep_their_taps_unless_they_may_spill(tmp_path, monkeypatch, spill, free,
+                                                                                      expected):
     monkeypatch.delenv(workers.ENV)
-    need = workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS)
+    if spill is None:
+        monkeypatch.delenv(workers.SPILL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(workers.SPILL_ENV, spill)
+    work = workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS)
+    keep = workers.hold(SONG_SIGNAL, SONG_TAPS)
 
-    assert need > 4414734336
-    assert workers.count(20, need, free=free, total=16 * GB, cpus=8) == expected
+    assert work > 1.8e9
+    assert keep == (0 if spill else 1.5 * SONG_SIGNAL * SONG_TAPS)
+    assert workers.count(20, work + keep, free=free, total=16 * GB, cpus=8) == expected
+
+
+def test_a_peak_measured_with_every_tap_held_is_not_read(tmp_path):
+    (tmp_path / workers.PEAKS).write_text(json.dumps({"per_tapped_signal": 2.28, "peak_bytes": 4414734336}))
+
+    assert workers.estimate(tmp_path, SONG_SIGNAL, SONG_TAPS) == workers.BASE_BYTES + workers.TAP_SIGNALS * SONG_SIGNAL * SONG_TAPS
 
 
 def test_a_peak_that_cant_be_written_never_fails_the_check(tmp_path):
@@ -275,7 +292,7 @@ def no_pool(*args, **kwargs):
 
 def read_only_peaks(cache):
     cache.mkdir(parents=True)
-    (cache / workers.PEAKS).write_text(json.dumps({"per_tapped_signal": 8, "peak_bytes": 400 << 20}))
+    (cache / workers.PEAKS).write_text(json.dumps({workers.FACTOR: 8, "peak_bytes": 400 << 20}))
     (cache / workers.PEAKS).chmod(0o444)
 
 
@@ -333,3 +350,11 @@ def test_cold_warm_and_partly_cached_checks_with_workers_match_one_process(tmp_p
     for pattern in ("contract-*.json", "[0-9a-f]*.json"):
         next(cache.glob(pattern)).unlink()
         assert check(tmp_path, recipe, False, 2, monkeypatch, tmp_path / "memo") == alone
+
+
+def test_a_workers_unused_budget_never_lowers_its_recorded_peak(tmp_path):
+    # A worker allowed 1 GiB of taps that held none: its whole peak over the base is working set.
+    signal, taps = 1 << 20, 100
+    workers.record(tmp_path, signal, taps, [workers.BASE_BYTES + 400 * signal])
+
+    assert workers.estimate(tmp_path, signal, taps) == workers.BASE_BYTES + 4 * signal * taps
