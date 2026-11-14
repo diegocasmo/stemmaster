@@ -118,3 +118,15 @@ def test_the_mix_fingerprint_binds_stem_order():
     swapped = {"stems": dict(reversed(mix["stems"].items()))}
     assert review.fingerprint(mix, ["inputs"]) == review.fingerprint(json.loads(json.dumps(mix)), ["inputs"])
     assert review.fingerprint(mix, ["inputs"]) != review.fingerprint(swapped, ["inputs"])
+
+
+def test_the_mix_fingerprint_ignores_key_order_render_never_reads():
+    mix = {"stems": {"a.wav": {}}, "moves": [{"move": "kick.gate", "source": "kick", "decision": "dropped", "note": "n"}]}
+    reordered = {"moves": [dict(reversed(mix["moves"][0].items()))], "stems": mix["stems"]}
+    assert review.fingerprint(mix, ["inputs"]) == review.fingerprint(reordered, ["inputs"])
+
+
+def test_the_mix_fingerprint_binds_a_trials_settings_order():
+    trial = lambda settings: {"moves": [{"move": "kick.gate", "trial": {"steps": [{"id": "t", "settings": settings}]}}]}
+    assert review.fingerprint(trial({"threshold_db": -30, "ratio": 4}), ["inputs"]) != \
+        review.fingerprint(trial({"ratio": 4, "threshold_db": -30}), ["inputs"])

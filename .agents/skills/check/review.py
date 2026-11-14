@@ -40,8 +40,13 @@ def mix_part(recipe, reviewed_trial):
 
 
 def fingerprint(mix, outside):
-    # Unsorted: render sums stems and orders buses and settings in recipe order, so order is part of the mix.
-    return sha(json.dumps({"recipe": mix, "inputs": outside}))
+    # Render sums stems and orders buses and settings in recipe order, so their order is part of the mix. The recipe's
+    # top-level keys and each move record's fields are not, so reordering them keeps the review.
+    canonical = {key: mix[key] for key in sorted(mix)}
+    if "moves" in canonical:
+        # Only each record's own fields: a trial's buses and settings inside it are applied in their order.
+        canonical["moves"] = [dict(sorted(record.items())) for record in canonical["moves"]]
+    return sha(json.dumps({"recipe": canonical, "inputs": outside}))
 
 
 def report_digest(numbers):
